@@ -1,142 +1,451 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
 
-export default function LoginPage() {
-  const [code, setCode] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
-  const [mouse, setMouse] = useState({ x: 0, y: 0 });
+type User = {
+  id: string;
+  name: string;
+  access_code: string;
+  role: string;
+};
+
+type Employee = {
+  id: string;
+  name: string;
+};
+
+type Session = {
+  id: string;
+  employee_id: string;
+  started_at: string;
+  ended_at: string | null;
+  status: string;
+  custom_note: string | null;
+  employees?: { name: string };
+  session_activities?: {
+    id?: string;
+    custom_text: string | null;
+    activity_types?: { name: string } | null;
+  }[];
+};
+
+type ActivityType = {
+  id: string;
+  name: string;
+};
+
+export default function CalendarPage() {
   const router = useRouter();
   const supabase = createClient();
 
+  const [user, setUser] = useState<User | null>(null);
+  const [sessions, setSessions] = useState<Session[]>([]);
+  const [employees, setEmployees] = useState<Employee[]>([]);
+  const [activities, setActivities] = useState<ActivityType[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [filter, setFilter] = useState<"day" | "week" | "month" | "custom">("week");
+  const [customFrom, setCustomFrom] = useState("");
+  const [customTo, setCustomTo] = useState("");
+  const [employeeFilter, setEmployeeFilter] = useState<string>("all");
+
+  // Add / Edit modal
+  const [showModal, setShowModal] = useState(false);
+  const [editingSession, setEditingSession] = useState<Session | null>(null);
+  const [formEmployee, setFormEmployee] = useState("");
+  const [formDate, setFormDate] = useState("");
+  const [formStart, setFormStart] = useState("09:00");
+  const [formEnd, setFormEnd] = useState("18:00");
+  const [formActivity, setFormActivity] = useState("");
+  const [formNote, setFormNote] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  const isAdmin = user?.role === "admin";
+
   useEffect(() => {
-    const handleMouse = (e: MouseEvent) => {
-      const x = (e.clientX / window.innerWidth - 0.5) * 24;
-      const y = (e.clientY / window.innerHeight - 0.5) * 24;
-      setMouse({ x, y });
-    };
-    window.addEventListener("mousemove", handleMouse);
-    return () => window.removeEventListener("mousemove", handleMouse);
-  }, []);
-
-  const handleLogin = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setLoading(true);
-    setError("");
-
-    const { data, error: fetchError } = await supabase
-      .from("employees")
-      .select("*")
-      .eq("access_code", code.trim().toUpperCase())
-      .single();
-
-    if (fetchError || !data) {
-      setError("Invalid access code");
-      setLoading(false);
+    const saved = localStorage.getItem("timeglass_user");
+    if (!saved) {
+      router.push("/");
       return;
     }
+    setUser(JSON.parse(saved));
+  }, [router]);
 
-    localStorage.setItem("timeglass_user", JSON.stringify(data));
-    localStorage.setItem("timeglass_last_activity", Date.now().toString());
-    router.push("/timer");
+  useEffect(() => {
+    if (!user) return;
+    loadData();
+  }, [user, filter, customFrom, customTo, employeeFilter]);
+
+  const loadData = async () => {
+    setLoading(true);
+
+    const { data: emps } = await supabase.from("employees").select("id, name").order("name");
+    if (emps) setEmployees(emps);
+
+    const { data: acts } = await supabase.from("activity_types").select("*").order("name");
+    if (acts) setActivities(acts);
+
+    const { from, to } = getDateRange();
+
+    let query = supabase
+      .from("work_sessions")
+      .select(`
+        id, employee_id, started_at, ended_at, status, custom_note,
+        employees ( name ),
+        session_activities ( id, custom_text, activity_types ( name ) )
+      `)
+      .eq("status", "completed")
+      .gte("started_at", from.toISOString())
+      .lte("started_at", to.toISOString())
+      .order("started_at", { ascending: false });
+
+    if (employeeFilter !== "all") {
+      query = query.eq("employee_id", employeeFilter);
+    }
+
+    const { data } = await query;
+    if (data) setSessions(data as any);
+    setLoading(false);
   };
 
-  return (
-    <div className="h-full flex flex-col items-center justify-center px-6 relative overflow-hidden">
-      {/* Floating glows */}
-      <div 
-        className="absolute w-56 h-56 rounded-full pointer-events-none"
-        style={{
-          top: "8%", left: "5%",
-          background: "radial-gradient(circle, rgba(124,58,237,0.4) 0%, transparent 70%)",
-          filter: "blur(40px)",
-          transform: `translate(${mouse.x * 0.7}px, ${mouse.y * 0.7}px)`,
-          transition: "transform 0.12s ease-out"
-        }}
-      />
-      <div 
-        className="absolute w-64 h-64 rounded-full pointer-events-none"
-        style={{
-          bottom: "10%", right: "0%",
-          background: "radial-gradient(circle, rgba(6,182,212,0.35) 0%, transparent 70%)",
-          filter: "blur(50px)",
-          transform: `translate(${mouse.x * -0.5}px, ${mouse.y * -0.5}px)`,
-          transition: "transform 0.12s ease-out"
-        }}
-      />
+  const getDateRange = () => {
+    const now = new Date();
+    let from: Date;
+    let to: Date = new Date(now);
+    to.setHours(23, 59, 59, 999);
 
-      <div className="w-full max-w-sm space-y-8 relative z-10">
-        {/* Branding */}
-        <div className="text-center space-y-1">
-          <h1 
-            className="text-4xl font-bold tracking-tight"
+    if (filter === "day") {
+      from = new Date(now);
+      from.setHours(0, 0, 0, 0);
+    } else if (filter === "week") {
+      from = new Date(now);
+      const day = from.getDay();
+      from.setDate(from.getDate() - (day === 0 ? 6 : day - 1));
+      from.setHours(0, 0, 0, 0);
+    } else if (filter === "month") {
+      from = new Date(now.getFullYear(), now.getMonth(), 1);
+    } else {
+      from = customFrom ? new Date(customFrom) : new Date(now.setDate(now.getDate() - 7));
+      to = customTo ? new Date(customTo) : new Date();
+      to.setHours(23, 59, 59, 999);
+    }
+    return { from, to };
+  };
+
+  const calcHours = (start: string, end: string | null) => {
+    if (!end) return "—";
+    const h = (new Date(end).getTime() - new Date(start).getTime()) / 3600000;
+    return h.toFixed(2) + "h";
+  };
+
+  const formatDate = (iso: string) =>
+    new Date(iso).toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" });
+
+  const formatTime = (iso: string) =>
+    new Date(iso).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+
+  const getActivities = (s: Session) => {
+    if (!s.session_activities?.length) return s.custom_note || "—";
+    return s.session_activities
+      .map((a) => a.activity_types?.name || a.custom_text || "")
+      .filter(Boolean)
+      .join(", ");
+  };
+
+  // Summary
+  const summary: Record<string, { name: string; hours: number; count: number }> = {};
+  sessions.forEach((s) => {
+    if (!s.ended_at) return;
+    const name = s.employees?.name || "Unknown";
+    const h = (new Date(s.ended_at).getTime() - new Date(s.started_at).getTime()) / 3600000;
+    if (!summary[s.employee_id]) summary[s.employee_id] = { name, hours: 0, count: 0 };
+    summary[s.employee_id].hours += h;
+    summary[s.employee_id].count += 1;
+  });
+
+  const openCreate = () => {
+    setEditingSession(null);
+    setFormEmployee(employees[0]?.id || "");
+    setFormDate(new Date().toISOString().slice(0, 10));
+    setFormStart("09:00");
+    setFormEnd("18:00");
+    setFormActivity(activities[0]?.id || "");
+    setFormNote("");
+    setShowModal(true);
+  };
+
+  const openEdit = (s: Session) => {
+    setEditingSession(s);
+    setFormEmployee(s.employee_id);
+    setFormDate(s.started_at.slice(0, 10));
+    setFormStart(formatTime(s.started_at));
+    setFormEnd(s.ended_at ? formatTime(s.ended_at) : "18:00");
+    setFormActivity("");
+    setFormNote(s.custom_note || "");
+    setShowModal(true);
+  };
+
+  const handleSave = async () => {
+    if (!formEmployee || !formDate || !formStart || !formEnd) return;
+    setSaving(true);
+
+    const startISO = new Date(`${formDate}T${formStart}:00`).toISOString();
+    const endISO = new Date(`${formDate}T${formEnd}:00`).toISOString();
+
+    if (editingSession) {
+      // Update
+      await supabase
+        .from("work_sessions")
+        .update({
+          employee_id: formEmployee,
+          started_at: startISO,
+          ended_at: endISO,
+          custom_note: formNote || null,
+        })
+        .eq("id", editingSession.id);
+    } else {
+      // Create
+      const { data: newSess } = await supabase
+        .from("work_sessions")
+        .insert({
+          employee_id: formEmployee,
+          started_at: startISO,
+          ended_at: endISO,
+          status: "completed",
+          custom_note: formNote || null,
+        })
+        .select()
+        .single();
+
+      if (newSess && formActivity) {
+        await supabase.from("session_activities").insert({
+          session_id: newSess.id,
+          activity_type_id: formActivity,
+        });
+      }
+    }
+
+    setSaving(false);
+    setShowModal(false);
+    loadData();
+  };
+
+  const handleDelete = async (id: string, name: string) => {
+    if (!confirm(`Delete session of ${name}?`)) return;
+    await supabase.from("session_activities").delete().eq("session_id", id);
+    await supabase.from("session_pauses").delete().eq("session_id", id);
+    await supabase.from("work_sessions").delete().eq("id", id);
+    loadData();
+  };
+
+  if (!user) {
+    return (
+      <div className="h-full flex items-center justify-center">
+        <p className="text-white/40">Loading...</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="h-full flex flex-col px-4 py-5 overflow-hidden">
+      {/* Header */}
+      <div className="flex items-center justify-between mb-4 shrink-0">
+        <div>
+          <p className="text-white/30 text-[11px] uppercase tracking-widest">Reports</p>
+          <p className="font-medium text-[15px]">Calendar</p>
+        </div>
+        <div className="flex gap-2">
+          {isAdmin && (
+            <button
+              onClick={openCreate}
+              className="text-xs px-3 py-1.5 rounded-lg font-medium"
+              style={{ background: "linear-gradient(135deg, #7c3aed 0%, #06b6d4 100%)" }}
+            >
+              + Add
+            </button>
+          )}
+          <button
+            onClick={() => router.push("/timer")}
+            className="text-sm px-3 py-1.5 rounded-xl"
+            style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.08)" }}
+          >
+            Back
+          </button>
+        </div>
+      </div>
+
+      {/* Filters */}
+      <div className="flex gap-2 mb-2 overflow-x-auto shrink-0 pb-1">
+        {(["day", "week", "month", "custom"] as const).map((f) => (
+          <button
+            key={f}
+            onClick={() => setFilter(f)}
+            className="px-3 py-1.5 rounded-lg text-xs capitalize shrink-0"
             style={{
-              background: "linear-gradient(135deg, #e0e0e0 0%, #a0a0a0 100%)",
-              WebkitBackgroundClip: "text",
-              WebkitTextFillColor: "transparent",
-              transform: `translate(${mouse.x * 0.1}px, ${mouse.y * 0.1}px)`,
-              transition: "transform 0.15s ease-out"
+              background: filter === f ? "rgba(124,58,237,0.3)" : "rgba(255,255,255,0.05)",
+              border: filter === f ? "1px solid rgba(124,58,237,0.5)" : "1px solid rgba(255,255,255,0.08)",
             }}
           >
-            MANIAC
-          </h1>
-          <p className="text-white/40 text-sm tracking-[0.3em] uppercase">TimeGlass</p>
-        </div>
+            {f}
+          </button>
+        ))}
+      </div>
 
-        {/* Glass card */}
-        <div 
-          className="rounded-3xl p-6 space-y-5"
-          style={{
-            background: "rgba(255,255,255,0.06)",
-            backdropFilter: "blur(24px)",
-            border: "1px solid rgba(255,255,255,0.1)",
-            boxShadow: "0 25px 50px rgba(0,0,0,0.4), inset 0 1px 0 rgba(255,255,255,0.08)",
-            transform: `perspective(800px) rotateY(${mouse.x * 0.08}deg) rotateX(${-mouse.y * 0.08}deg) translate(${mouse.x * 0.05}px, ${mouse.y * 0.05}px)`,
-            transition: "transform 0.15s ease-out"
-          }}
+      {/* Employee filter */}
+      <div className="mb-3 shrink-0">
+        <select
+          value={employeeFilter}
+          onChange={(e) => setEmployeeFilter(e.target.value)}
+          className="w-full px-3 py-2 rounded-xl text-sm outline-none"
+          style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.1)" }}
         >
-          <p className="text-center text-white/50 text-sm">Enter your access code</p>
+          <option value="all">All employees</option>
+          {employees.map((e) => (
+            <option key={e.id} value={e.id}>{e.name}</option>
+          ))}
+        </select>
+      </div>
 
-          <form onSubmit={handleLogin} className="space-y-4">
-            <input
-              type="text"
-              value={code}
-              onChange={(e) => setCode(e.target.value.toUpperCase())}
-              placeholder="ACCESS CODE"
-              className="w-full bg-transparent text-center text-lg tracking-[0.25em] font-medium py-4 px-4 outline-none placeholder:text-white/20 uppercase rounded-2xl"
-              style={{
-                background: "rgba(255,255,255,0.04)",
-                border: "1px solid rgba(255,255,255,0.08)"
-              }}
-              autoFocus
-              autoComplete="off"
-            />
+      {filter === "custom" && (
+        <div className="flex gap-2 mb-3 shrink-0">
+          <input type="date" value={customFrom} onChange={(e) => setCustomFrom(e.target.value)}
+            className="flex-1 px-3 py-2 rounded-xl text-sm outline-none"
+            style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.1)" }} />
+          <input type="date" value={customTo} onChange={(e) => setCustomTo(e.target.value)}
+            className="flex-1 px-3 py-2 rounded-xl text-sm outline-none"
+            style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.1)" }} />
+        </div>
+      )}
 
-            {error && (
-              <p className="text-red-400 text-sm text-center">{error}</p>
+      {/* Summary */}
+      {Object.keys(summary).length > 0 && (
+        <div className="rounded-2xl p-3 mb-3 shrink-0"
+          style={{ background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.06)" }}>
+          <p className="text-white/40 text-[10px] uppercase tracking-wider mb-2">Summary</p>
+          <div className="space-y-1.5">
+            {Object.values(summary).map((s) => (
+              <div key={s.name} className="flex justify-between text-sm">
+                <span className="text-white/80">{s.name}</span>
+                <span className="text-white/50">{s.hours.toFixed(1)}h · {s.count} sessions</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Sessions */}
+      <div className="flex-1 overflow-y-auto space-y-2 pr-1" style={{ overscrollBehavior: "contain" }}>
+        {loading ? (
+          <p className="text-white/30 text-sm text-center py-8">Loading...</p>
+        ) : sessions.length === 0 ? (
+          <p className="text-white/30 text-sm text-center py-8">No sessions found</p>
+        ) : (
+          sessions.map((s) => (
+            <div key={s.id} className="rounded-xl p-3"
+              style={{ background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.06)" }}>
+              <div className="flex justify-between items-start mb-1">
+                <p className="font-medium text-sm">{s.employees?.name || "Unknown"}</p>
+                <p className="text-white/50 text-xs">{calcHours(s.started_at, s.ended_at)}</p>
+              </div>
+              <p className="text-white/40 text-xs">
+                {formatDate(s.started_at)} · {formatTime(s.started_at)}
+                {s.ended_at && ` — ${formatTime(s.ended_at)}`}
+              </p>
+              <p className="text-white/60 text-xs mt-1.5 leading-relaxed">{getActivities(s)}</p>
+
+              {isAdmin && (
+                <div className="flex gap-2 mt-2.5">
+                  <button onClick={() => openEdit(s)} className="text-[11px] px-2.5 py-1 rounded-lg"
+                    style={{ background: "rgba(255,255,255,0.08)" }}>Edit</button>
+                  <button onClick={() => handleDelete(s.id, s.employees?.name || "")}
+                    className="text-[11px] px-2.5 py-1 rounded-lg text-red-300"
+                    style={{ background: "rgba(239,68,68,0.15)" }}>Delete</button>
+                </div>
+              )}
+            </div>
+          ))
+        )}
+      </div>
+
+      {/* Create / Edit Modal */}
+      {showModal && (
+        <div className="absolute inset-0 z-50 flex items-end justify-center bg-black/70"
+          style={{ backdropFilter: "blur(8px)" }}
+          onClick={(e) => { if (e.target === e.currentTarget) setShowModal(false); }}>
+          <div className="w-full max-w-md rounded-t-3xl p-6 space-y-4"
+            style={{ background: "rgba(18,18,26,0.98)", border: "1px solid rgba(255,255,255,0.1)" }}
+            onClick={(e) => e.stopPropagation()}>
+            <h2 className="text-lg font-medium text-center">
+              {editingSession ? "Edit Session" : "Add Session"}
+            </h2>
+
+            <div>
+              <label className="text-white/40 text-xs uppercase">Employee</label>
+              <select value={formEmployee} onChange={(e) => setFormEmployee(e.target.value)}
+                className="w-full mt-1 px-3 py-2.5 rounded-xl text-sm outline-none"
+                style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.1)" }}>
+                {employees.map((e) => (
+                  <option key={e.id} value={e.id}>{e.name}</option>
+                ))}
+              </select>
+            </div>
+
+            <div>
+              <label className="text-white/40 text-xs uppercase">Date</label>
+              <input type="date" value={formDate} onChange={(e) => setFormDate(e.target.value)}
+                className="w-full mt-1 px-3 py-2.5 rounded-xl text-sm outline-none"
+                style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.1)" }} />
+            </div>
+
+            <div className="flex gap-3">
+              <div className="flex-1">
+                <label className="text-white/40 text-xs uppercase">From</label>
+                <input type="time" value={formStart} onChange={(e) => setFormStart(e.target.value)}
+                  className="w-full mt-1 px-3 py-2.5 rounded-xl text-sm outline-none"
+                  style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.1)" }} />
+              </div>
+              <div className="flex-1">
+                <label className="text-white/40 text-xs uppercase">To</label>
+                <input type="time" value={formEnd} onChange={(e) => setFormEnd(e.target.value)}
+                  className="w-full mt-1 px-3 py-2.5 rounded-xl text-sm outline-none"
+                  style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.1)" }} />
+              </div>
+            </div>
+
+            {!editingSession && (
+              <div>
+                <label className="text-white/40 text-xs uppercase">Activity</label>
+                <select value={formActivity} onChange={(e) => setFormActivity(e.target.value)}
+                  className="w-full mt-1 px-3 py-2.5 rounded-xl text-sm outline-none"
+                  style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.1)" }}>
+                  {activities.map((a) => (
+                    <option key={a.id} value={a.id}>{a.name}</option>
+                  ))}
+                </select>
+              </div>
             )}
 
-            <button
-              type="submit"
-              disabled={loading || code.length < 3}
-              className="w-full py-4 rounded-2xl font-medium transition-all disabled:opacity-40 disabled:cursor-not-allowed active:scale-[0.98]"
-              style={{
-                background: "linear-gradient(135deg, #7c3aed 0%, #06b6d4 100%)",
-                boxShadow: "0 8px 24px rgba(124, 58, 237, 0.35)"
-              }}
-            >
-              {loading ? "Checking..." : "Sign In"}
-            </button>
-          </form>
-        </div>
+            <div>
+              <label className="text-white/40 text-xs uppercase">Note</label>
+              <input type="text" value={formNote} onChange={(e) => setFormNote(e.target.value)}
+                placeholder="Optional note..."
+                className="w-full mt-1 px-3 py-2.5 rounded-xl text-sm outline-none"
+                style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.1)" }} />
+            </div>
 
-        <p className="text-center text-white/20 text-xs">
-          Contact admin if you don't have a code
-        </p>
-      </div>
+            <div className="flex gap-3 pt-2">
+              <button onClick={() => setShowModal(false)} className="flex-1 py-3 rounded-xl text-sm"
+                style={{ background: "rgba(255,255,255,0.07)" }}>Cancel</button>
+              <button onClick={handleSave} disabled={saving}
+                className="flex-1 py-3 rounded-xl text-sm font-medium disabled:opacity-50"
+                style={{ background: "linear-gradient(135deg, #7c3aed 0%, #06b6d4 100%)" }}>
+                {saving ? "Saving..." : "Save"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

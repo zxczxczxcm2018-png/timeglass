@@ -41,6 +41,26 @@ function playSound(type: "start" | "stop" | "notify") {
   } catch {}
 }
 
+async function requestNotificationPermission() {
+  if (!("Notification" in window)) return;
+  if (Notification.permission === "default") {
+    await Notification.requestPermission();
+  }
+}
+
+function sendSystemNotification(title: string, body: string) {
+  if (!("Notification" in window)) return;
+  if (Notification.permission === "granted") {
+    try {
+      new Notification(title, {
+        body,
+        silent: false,
+        // icon can be added later
+      });
+    } catch {}
+  }
+}
+
 export default function TimerPage() {
   const router = useRouter();
   const supabase = createClient();
@@ -79,16 +99,19 @@ export default function TimerPage() {
   const inactivityTimerRef = useRef<NodeJS.Timeout | null>(null);
   const pauseReasonRef = useRef<"manual" | "internet" | null>(null);
 
-  const showToast = (msg: string) => {
+  const showToast = (msg: string, title = "TimeGlass") => {
     setToast(msg);
     setTimeout(() => setToast(null), 4500);
+    // System notification (Windows toast)
+    sendSystemNotification(title, msg);
   };
 
-  // Auth + inactivity
+  // Auth + inactivity + notification permission
   useEffect(() => {
     const saved = localStorage.getItem("timeglass_user");
     if (!saved) { router.push("/"); return; }
     setUser(JSON.parse(saved));
+    requestNotificationPermission();
 
     const resetInactivity = () => {
       localStorage.setItem("timeglass_last_activity", Date.now().toString());
@@ -292,8 +315,15 @@ export default function TimerPage() {
     const [eh, em] = adjustEnd.split(":").map(Number);
     const newStart = new Date(sessionStart); newStart.setHours(sh, sm, 0, 0);
     const newEnd = new Date(sessionEnd); newEnd.setHours(eh, em, 0, 0);
-    if (newStart < sessionStart || newEnd > sessionEnd || newStart >= newEnd) {
-      alert("Invalid time range"); return;
+
+    // ±5 minutes tolerance
+    const TOLERANCE_MS = 5 * 60 * 1000;
+    const minStart = new Date(sessionStart.getTime() - TOLERANCE_MS);
+    const maxEnd = new Date(sessionEnd.getTime() + TOLERANCE_MS);
+
+    if (newStart < minStart || newEnd > maxEnd || newStart >= newEnd) {
+      alert("Time must be within ±5 minutes of the real session");
+      return;
     }
     await supabase.from("work_sessions").update({
       started_at: newStart.toISOString(), ended_at: newEnd.toISOString(), status: "completed",
