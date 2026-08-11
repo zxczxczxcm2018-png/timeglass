@@ -192,11 +192,16 @@ export default function TimerPage() {
     return () => { if (intervalRef.current) clearInterval(intervalRef.current); };
   }, [isRunning, isPaused]);
 
-  // Offline
+  // Offline: pause after 2 min, auto-complete after 1 hour offline
   useEffect(() => {
+    let autoCompleteTimer: NodeJS.Timeout | null = null;
+
     const handleOffline = () => {
       setIsOffline(true);
       if (offlineTimerRef.current) clearTimeout(offlineTimerRef.current);
+      if (autoCompleteTimer) clearTimeout(autoCompleteTimer);
+
+      // Pause after 2 minutes offline
       offlineTimerRef.current = setTimeout(async () => {
         if (!navigator.onLine && isRunning && !isPaused) {
           setIsPaused(true);
@@ -208,10 +213,29 @@ export default function TimerPage() {
           }
         }
       }, 2 * 60 * 1000);
+
+      // Auto-complete after 1 hour offline
+      autoCompleteTimer = setTimeout(async () => {
+        if (!navigator.onLine && isRunning && sessionId) {
+          await supabase
+            .from("work_sessions")
+            .update({ ended_at: new Date().toISOString(), status: "completed" })
+            .eq("id", sessionId);
+          setIsRunning(false);
+          setIsPaused(false);
+          setSessionId(null);
+          setSeconds(0);
+          setStatusText("Session auto-completed (offline 1h)");
+          showToast("Session auto-completed after 1 hour offline");
+          pauseReasonRef.current = null;
+        }
+      }, 60 * 60 * 1000);
     };
+
     const handleOnline = async () => {
       setIsOffline(false);
       if (offlineTimerRef.current) { clearTimeout(offlineTimerRef.current); offlineTimerRef.current = null; }
+      if (autoCompleteTimer) { clearTimeout(autoCompleteTimer); autoCompleteTimer = null; }
       if (isRunning && isPaused && pauseReasonRef.current === "internet") {
         setIsPaused(false);
         pauseReasonRef.current = null;
@@ -230,6 +254,7 @@ export default function TimerPage() {
       window.removeEventListener("offline", handleOffline);
       window.removeEventListener("online", handleOnline);
       if (offlineTimerRef.current) clearTimeout(offlineTimerRef.current);
+      if (autoCompleteTimer) clearTimeout(autoCompleteTimer);
     };
   }, [isRunning, isPaused, sessionId]);
 
@@ -254,6 +279,22 @@ export default function TimerPage() {
 
   const handleStart = async () => {
     if (!user) return;
+
+    // Close any stuck running sessions for this employee
+    const { data: stuck } = await supabase
+      .from("work_sessions")
+      .select("id")
+      .eq("employee_id", user.id)
+      .eq("status", "running");
+    if (stuck && stuck.length > 0) {
+      for (const s of stuck) {
+        await supabase
+          .from("work_sessions")
+          .update({ ended_at: new Date().toISOString(), status: "completed" })
+          .eq("id", s.id);
+      }
+    }
+
     const { data, error } = await supabase.from("work_sessions").insert({
       employee_id: user.id, started_at: new Date().toISOString(), status: "running"
     }).select().single();
@@ -422,6 +463,7 @@ export default function TimerPage() {
         </div>
         <div className="flex gap-2">
           <button onClick={() => router.push("/calendar")} className="text-xs px-2.5 py-1.5 rounded-lg" style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.08)" }}>Calendar</button>
+          <button onClick={() => window.open("/board", "_blank")} className="text-xs px-2.5 py-1.5 rounded-lg" style={{ background: "rgba(6,182,212,0.15)", border: "1px solid rgba(6,182,212,0.3)" }}>Board</button>
           {user.role === "admin" && (
             <button onClick={() => router.push("/admin")} className="text-xs px-2.5 py-1.5 rounded-lg" style={{ background: "rgba(124,58,237,0.2)", border: "1px solid rgba(124,58,237,0.35)" }}>Admin</button>
           )}
