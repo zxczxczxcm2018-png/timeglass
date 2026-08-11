@@ -148,10 +148,10 @@ export default function CalendarPage() {
 
   const getActivities = (s: Session) => {
     if (!s.session_activities?.length) return s.custom_note || "—";
-    return s.session_activities
+    const names = s.session_activities
       .map((a) => a.activity_types?.name || a.custom_text || "")
-      .filter(Boolean)
-      .join(", ");
+      .filter(Boolean);
+    return [...new Set(names)].join(", ");
   };
 
   // Summary
@@ -226,6 +226,44 @@ export default function CalendarPage() {
 
     const startISO = new Date(`${formDate}T${formStart}:00`).toISOString();
     const endISO = new Date(`${formDate}T${formEnd}:00`).toISOString();
+    const newStart = new Date(startISO).getTime();
+    const newEnd = new Date(endISO).getTime();
+
+    if (newStart >= newEnd) {
+      alert("End time must be after start time");
+      setSaving(false);
+      return;
+    }
+
+    // Overlap check
+    const dayStart = `${formDate}T00:00:00.000Z`;
+    const dayEnd = `${formDate}T23:59:59.999Z`;
+
+    let query = supabase
+      .from("work_sessions")
+      .select("id, started_at, ended_at")
+      .eq("employee_id", formEmployee)
+      .eq("status", "completed")
+      .gte("started_at", dayStart)
+      .lte("started_at", dayEnd);
+
+    if (editingSession) {
+      query = query.neq("id", editingSession.id);
+    }
+
+    const { data: existing } = await query;
+    if (existing) {
+      for (const s of existing) {
+        if (!s.ended_at) continue;
+        const sStart = new Date(s.started_at).getTime();
+        const sEnd = new Date(s.ended_at).getTime();
+        if (newStart < sEnd && newEnd > sStart) {
+          alert("This time overlaps with another session. One hour can only be registered once.");
+          setSaving(false);
+          return;
+        }
+      }
+    }
 
     if (editingSession) {
       await supabase
@@ -331,11 +369,11 @@ export default function CalendarPage() {
           value={employeeFilter}
           onChange={(e) => setEmployeeFilter(e.target.value)}
           className="w-full px-3 py-2 rounded-xl text-sm outline-none"
-          style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.1)" }}
+          style={{ background: "#1a1a24", color: "#fff", border: "1px solid rgba(255,255,255,0.15)" }}
         >
-          <option value="all">All employees</option>
+          <option value="all" style={{ background: "#1a1a24", color: "#fff" }}>All employees</option>
           {employees.map((e) => (
-            <option key={e.id} value={e.id}>{e.name}</option>
+            <option key={e.id} value={e.id} style={{ background: "#1a1a24", color: "#fff" }}>{e.name}</option>
           ))}
         </select>
       </div>
@@ -465,9 +503,9 @@ export default function CalendarPage() {
               <label className="text-white/40 text-xs uppercase">Employee</label>
               <select value={formEmployee} onChange={(e) => setFormEmployee(e.target.value)}
                 className="w-full mt-1 px-3 py-2.5 rounded-xl text-sm outline-none"
-                style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.1)" }}>
+                style={{ background: "#1a1a24", color: "#fff", border: "1px solid rgba(255,255,255,0.15)" }}>
                 {employees.map((e) => (
-                  <option key={e.id} value={e.id}>{e.name}</option>
+                  <option key={e.id} value={e.id} style={{ background: "#1a1a24", color: "#fff" }}>{e.name}</option>
                 ))}
               </select>
             </div>
@@ -499,9 +537,9 @@ export default function CalendarPage() {
                 <label className="text-white/40 text-xs uppercase">Activity</label>
                 <select value={formActivity} onChange={(e) => setFormActivity(e.target.value)}
                   className="w-full mt-1 px-3 py-2.5 rounded-xl text-sm outline-none"
-                  style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.1)" }}>
+                  style={{ background: "#1a1a24", color: "#fff", border: "1px solid rgba(255,255,255,0.15)" }}>
                   {activities.map((a) => (
-                    <option key={a.id} value={a.id}>{a.name}</option>
+                    <option key={a.id} value={a.id} style={{ background: "#1a1a24", color: "#fff" }}>{a.name}</option>
                   ))}
                 </select>
               </div>

@@ -170,11 +170,11 @@ export default function AdminPage() {
           <select
             value={newRole}
             onChange={(e) => setNewRole(e.target.value as "employee" | "admin")}
-            className="flex-1 px-3 py-2.5 rounded-xl outline-none text-sm bg-transparent"
-            style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.1)" }}
+            className="flex-1 px-3 py-2.5 rounded-xl outline-none text-sm"
+            style={{ background: "#1a1a24", color: "#fff", border: "1px solid rgba(255,255,255,0.15)" }}
           >
-            <option value="employee">Employee</option>
-            <option value="admin">Admin</option>
+            <option value="employee" style={{ background: "#1a1a24", color: "#fff" }}>Employee</option>
+            <option value="admin" style={{ background: "#1a1a24", color: "#fff" }}>Admin</option>
           </select>
 
           <button
@@ -245,10 +245,10 @@ export default function AdminPage() {
                     value={editRole}
                     onChange={(e) => setEditRole(e.target.value as "employee" | "admin")}
                     className="w-full px-3 py-2 rounded-lg outline-none text-sm"
-                    style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.1)" }}
+                    style={{ background: "#1a1a24", color: "#fff", border: "1px solid rgba(255,255,255,0.15)" }}
                   >
-                    <option value="employee">Employee</option>
-                    <option value="admin">Admin</option>
+                    <option value="employee" style={{ background: "#1a1a24", color: "#fff" }}>Employee</option>
+                    <option value="admin" style={{ background: "#1a1a24", color: "#fff" }}>Admin</option>
                   </select>
                   <div className="flex gap-2">
                     <button

@@ -290,14 +290,29 @@ export default function TimerPage() {
 
   const handleConfirmActivities = async () => {
     if (!sessionId) return;
-    for (const name of selectedNames) {
+
+    // Unique activities only
+    const uniqueNames = [...new Set(selectedNames)];
+    // Clear any previous activities for this session first
+    await supabase.from("session_activities").delete().eq("session_id", sessionId);
+
+    for (const name of uniqueNames) {
       if (name === "Other") continue;
       const found = activities.find(a => a.name === name);
-      if (found) await supabase.from("session_activities").insert({ session_id: sessionId, activity_type_id: found.id });
+      if (found) {
+        await supabase.from("session_activities").insert({
+          session_id: sessionId,
+          activity_type_id: found.id,
+        });
+      }
     }
-    if (selectedNames.includes("Other") && otherText.trim()) {
-      await supabase.from("session_activities").insert({ session_id: sessionId, custom_text: otherText.trim() });
+    if (uniqueNames.includes("Other") && otherText.trim()) {
+      await supabase.from("session_activities").insert({
+        session_id: sessionId,
+        custom_text: otherText.trim(),
+      });
     }
+
     const { data: session } = await supabase.from("work_sessions").select("*").eq("id", sessionId).single();
     const { data: pausesData } = await supabase.from("session_pauses").select("*").eq("session_id", sessionId).order("paused_at");
     if (session) {
@@ -310,7 +325,7 @@ export default function TimerPage() {
   };
 
   const handleFinalSave = async () => {
-    if (!sessionId || !sessionStart || !sessionEnd) return;
+    if (!sessionId || !sessionStart || !sessionEnd || !user) return;
     const [sh, sm] = adjustStart.split(":").map(Number);
     const [eh, em] = adjustEnd.split(":").map(Number);
     const newStart = new Date(sessionStart); newStart.setHours(sh, sm, 0, 0);
@@ -324,6 +339,34 @@ export default function TimerPage() {
     if (newStart < minStart || newEnd > maxEnd || newStart >= newEnd) {
       alert("Time must be within ±5 minutes of the real session");
       return;
+    }
+
+    // Check for overlapping sessions (same employee, same day, overlapping hours)
+    const dayStart = new Date(newStart); dayStart.setHours(0, 0, 0, 0);
+    const dayEnd = new Date(newStart); dayEnd.setHours(23, 59, 59, 999);
+
+    const { data: existing } = await supabase
+      .from("work_sessions")
+      .select("id, started_at, ended_at")
+      .eq("employee_id", user.id)
+      .eq("status", "completed")
+      .neq("id", sessionId)
+      .gte("started_at", dayStart.toISOString())
+      .lte("started_at", dayEnd.toISOString());
+
+    if (existing) {
+      for (const s of existing) {
+        if (!s.ended_at) continue;
+        const sStart = new Date(s.started_at).getTime();
+        const sEnd = new Date(s.ended_at).getTime();
+        const nStart = newStart.getTime();
+        const nEnd = newEnd.getTime();
+        // Overlap if ranges intersect
+        if (nStart < sEnd && nEnd > sStart) {
+          alert("This time overlaps with another session on the same day. One hour can only be registered once.");
+          return;
+        }
+      }
     }
     await supabase.from("work_sessions").update({
       started_at: newStart.toISOString(), ended_at: newEnd.toISOString(), status: "completed",
