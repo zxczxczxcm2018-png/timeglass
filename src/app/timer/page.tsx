@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useState, useRef, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
 
@@ -12,7 +12,6 @@ type User = {
 };
 
 type ActivityType = { id: string; name: string };
-type Pause = { id: string; paused_at: string; resumed_at: string | null };
 
 const CATEGORIES = [
   { id: "ticket-review", name: "Ticket Review", children: ["Ticket Review — New", "Ticket Review — Approved", "Ticket Review — Finished"] },
@@ -24,41 +23,68 @@ const CATEGORIES = [
   { id: "other", name: "Other", children: null },
 ];
 
-function playSound(type: "start" | "stop" | "notify") {
+const TIMER_KEY = "timeglass_active_timer";
+
+type SavedTimer = {
+  sessionId: string;
+  startedAt: number;       // Date.now() when started (or last resumed)
+  totalPausedMs: number;   // accumulated pause time
+  pausedAt: number | null; // Date.now() when paused, null if running
+  isPaused: boolean;
+  pauseReason: "manual" | "internet" | null;
+};
+
+function playSound(type: "start" | "stop" | "notify" | "pause") {
   try {
     const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
     const osc = ctx.createOscillator();
     const gain = ctx.createGain();
     osc.connect(gain);
     gain.connect(ctx.destination);
-    gain.gain.value = 0.07;
-    if (type === "start") osc.frequency.value = 523;
-    else if (type === "stop") osc.frequency.value = 392;
-    else osc.frequency.value = 440;
+    gain.gain.value = 0.08;
+    const freqs = { start: 523, stop: 392, notify: 440, pause: 330 };
+    osc.frequency.value = freqs[type];
     osc.start();
-    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.25);
-    osc.stop(ctx.currentTime + 0.25);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.3);
+    osc.stop(ctx.currentTime + 0.3);
   } catch {}
 }
 
-async function requestNotificationPermission() {
-  if (!("Notification" in window)) return;
-  if (Notification.permission === "default") {
-    await Notification.requestPermission();
+function sendNotify(title: string, body: string) {
+  try {
+    if (!("Notification" in window)) return;
+    if (Notification.permission === "granted") {
+      new Notification(title, { body, silent: false });
+    } else if (Notification.permission !== "denied") {
+      Notification.requestPermission().then((p) => {
+        if (p === "granted") new Notification(title, { body, silent: false });
+      });
+    }
+  } catch {}
+}
+
+function loadSavedTimer(): SavedTimer | null {
+  try {
+    const raw = localStorage.getItem(TIMER_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
   }
 }
 
-function sendSystemNotification(title: string, body: string) {
-  if (!("Notification" in window)) return;
-  if (Notification.permission === "granted") {
-    try {
-      new Notification(title, {
-        body,
-        silent: false,
-        // icon can be added later
-      });
-    } catch {}
+function saveTimer(t: SavedTimer | null) {
+  if (t) localStorage.setItem(TIMER_KEY, JSON.stringify(t));
+  else localStorage.removeItem(TIMER_KEY);
+}
+
+function calcSeconds(t: SavedTimer): number {
+  const now = Date.now();
+  let paused = t.totalPausedMs;
+  if (t.isPaused && t.pausedAt) {
+    paused += now - t.pausedAt;
   }
+  const elapsed = now - t.startedAt - paused;
+  return Math.max(0, Math.floor(elapsed / 1000));
 }
 
 export default function TimerPage() {
@@ -75,12 +101,10 @@ export default function TimerPage() {
   const [isOffline, setIsOffline] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
 
-  // Stats
   const [hoursToday, setHoursToday] = useState(0);
   const [hoursWeek, setHoursWeek] = useState(0);
   const [hoursMonth, setHoursMonth] = useState(0);
 
-  // Modals
   const [showActivityModal, setShowActivityModal] = useState(false);
   const [activities, setActivities] = useState<ActivityType[]>([]);
   const [selectedNames, setSelectedNames] = useState<string[]>([]);
@@ -89,67 +113,151 @@ export default function TimerPage() {
   const [showTimeModal, setShowTimeModal] = useState(false);
   const [sessionStart, setSessionStart] = useState<Date | null>(null);
   const [sessionEnd, setSessionEnd] = useState<Date | null>(null);
-  const [pauses, setPauses] = useState<Pause[]>([]);
   const [adjustStart, setAdjustStart] = useState("");
   const [adjustEnd, setAdjustEnd] = useState("");
 
-  const intervalRef = useRef<NodeJS.Timeout | null>(null);
-  const offlineTimerRef = useRef<NodeJS.Timeout | null>(null);
-  const reminderTimerRef = useRef<NodeJS.Timeout | null>(null);
-  const inactivityTimerRef = useRef<NodeJS.Timeout | null>(null);
-  const pauseReasonRef = useRef<"manual" | "internet" | null>(null);
+  // Interrupted session recovery
+  const [recoverySession, setRecoverySession] = useState<{
+    id: string;
+    started_at: string;
+    ended_at: string;
+  } | null>(null);
+  const [showRecovery, setShowRecovery] = useState(false);
 
-  const showToast = (msg: string, title = "TimeGlass") => {
+  const timerRef = useRef<SavedTimer | null>(null);
+  const tickRef = useRef<NodeJS.Timeout | null>(null);
+  const offlinePauseRef = useRef<NodeJS.Timeout | null>(null);
+  const offlineCompleteRef = useRef<NodeJS.Timeout | null>(null);
+  const reminderRef = useRef<NodeJS.Timeout | null>(null);
+
+  const showToast = (msg: string) => {
     setToast(msg);
     setTimeout(() => setToast(null), 4500);
-    // System notification (Windows toast)
-    sendSystemNotification(title, msg);
+    sendNotify("TimeGlass", msg);
   };
 
-  // Auth + inactivity + notification permission
+  // Auth + restore timer + notifications
   useEffect(() => {
     const saved = localStorage.getItem("timeglass_user");
     if (!saved) { router.push("/"); return; }
     setUser(JSON.parse(saved));
-    requestNotificationPermission();
 
-    const resetInactivity = () => {
-      localStorage.setItem("timeglass_last_activity", Date.now().toString());
-      if (inactivityTimerRef.current) clearTimeout(inactivityTimerRef.current);
-      inactivityTimerRef.current = setTimeout(() => {
-        if (!isRunning) {
-          localStorage.removeItem("timeglass_user");
-          router.push("/");
-        }
-      }, 60 * 60 * 1000); // 1 hour
-    };
+    // Request notifications
+    if ("Notification" in window && Notification.permission === "default") {
+      Notification.requestPermission();
+    }
 
-    resetInactivity();
-    window.addEventListener("mousemove", resetInactivity);
-    window.addEventListener("keydown", resetInactivity);
-    window.addEventListener("click", resetInactivity);
+    // Restore active timer from localStorage
+    const t = loadSavedTimer();
+    if (t && t.sessionId) {
+      timerRef.current = t;
+      setSessionId(t.sessionId);
+      setIsRunning(true);
+      setIsPaused(t.isPaused);
+      setSeconds(calcSeconds(t));
+      setStatusText(t.isPaused ? (t.pauseReason === "internet" ? "No internet — paused" : "Paused") : "Working...");
+    }
+  }, [router]);
 
-    return () => {
-      window.removeEventListener("mousemove", resetInactivity);
-      window.removeEventListener("keydown", resetInactivity);
-      window.removeEventListener("click", resetInactivity);
-      if (inactivityTimerRef.current) clearTimeout(inactivityTimerRef.current);
-    };
-  }, [router, isRunning]);
-
-  // Load activities + stats
+  // Check for interrupted sessions after login
   useEffect(() => {
     if (!user) return;
-    const load = async () => {
+    // Don't show recovery if timer is currently running from localStorage
+    if (timerRef.current) return;
+
+    (async () => {
+      // 1. Running sessions left behind (PC crashed / closed without stop)
+      const { data: running } = await supabase
+        .from("work_sessions")
+        .select("id, started_at")
+        .eq("employee_id", user.id)
+        .eq("status", "running")
+        .order("started_at", { ascending: false });
+
+      if (running && running.length > 0) {
+        // Complete them and offer recovery for the latest
+        const latest = running[0];
+        const endTime = new Date().toISOString();
+        for (const s of running) {
+          await supabase.from("work_sessions").update({
+            status: "completed",
+            ended_at: endTime,
+          }).eq("id", s.id);
+        }
+        // Check if latest has no activities
+        const { data: acts } = await supabase
+          .from("session_activities")
+          .select("id")
+          .eq("session_id", latest.id)
+          .limit(1);
+        if (!acts || acts.length === 0) {
+          setRecoverySession({
+            id: latest.id,
+            started_at: latest.started_at,
+            ended_at: endTime,
+          });
+          setShowRecovery(true);
+        }
+        return;
+      }
+
+      // 2. Recently completed sessions without any activity (auto-completed offline)
+      const since = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+      const { data: completed } = await supabase
+        .from("work_sessions")
+        .select("id, started_at, ended_at")
+        .eq("employee_id", user.id)
+        .eq("status", "completed")
+        .gte("ended_at", since)
+        .order("ended_at", { ascending: false })
+        .limit(5);
+
+      if (completed) {
+        for (const s of completed) {
+          const { data: acts } = await supabase
+            .from("session_activities")
+            .select("id")
+            .eq("session_id", s.id)
+            .limit(1);
+          if (!acts || acts.length === 0) {
+            setRecoverySession({
+              id: s.id,
+              started_at: s.started_at,
+              ended_at: s.ended_at || s.started_at,
+            });
+            setShowRecovery(true);
+            break;
+          }
+        }
+      }
+    })();
+  }, [user]);
+
+  // Tick: recalculate from timestamps every second (works even after minimize)
+  useEffect(() => {
+    if (isRunning) {
+      tickRef.current = setInterval(() => {
+        if (timerRef.current) {
+          setSeconds(calcSeconds(timerRef.current));
+        }
+      }, 1000);
+    }
+    return () => { if (tickRef.current) clearInterval(tickRef.current); };
+  }, [isRunning]);
+
+  // Load stats + activities
+  useEffect(() => {
+    if (!user) return;
+    (async () => {
       const { data } = await supabase.from("activity_types").select("*");
       if (data) setActivities(data);
 
       const now = new Date();
-      const startOfDay = new Date(now); startOfDay.setHours(0,0,0,0);
+      const startOfDay = new Date(now); startOfDay.setHours(0, 0, 0, 0);
       const startOfWeek = new Date(now);
       const day = startOfWeek.getDay();
       startOfWeek.setDate(startOfWeek.getDate() - (day === 0 ? 6 : day - 1));
-      startOfWeek.setHours(0,0,0,0);
+      startOfWeek.setHours(0, 0, 0, 0);
       const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
 
       const { data: sessions } = await supabase
@@ -167,179 +275,239 @@ export default function TimerPage() {
         if (new Date(s.started_at) >= startOfWeek) w += h;
         if (new Date(s.started_at) >= startOfDay) t += h;
       });
-      setHoursToday(t);
-      setHoursWeek(w);
-      setHoursMonth(m);
-    };
-    load();
+      setHoursToday(t); setHoursWeek(w); setHoursMonth(m);
+    })();
   }, [user]);
 
+  // Mouse glow
   useEffect(() => {
-    const handleMouse = (e: MouseEvent) => {
-      setMouse({
-        x: (e.clientX / window.innerWidth - 0.5) * 18,
-        y: (e.clientY / window.innerHeight - 0.5) * 18,
-      });
-    };
-    window.addEventListener("mousemove", handleMouse);
-    return () => window.removeEventListener("mousemove", handleMouse);
+    const h = (e: MouseEvent) => setMouse({
+      x: (e.clientX / window.innerWidth - 0.5) * 18,
+      y: (e.clientY / window.innerHeight - 0.5) * 18,
+    });
+    window.addEventListener("mousemove", h);
+    return () => window.removeEventListener("mousemove", h);
   }, []);
 
+  // REAL offline only (not minimize)
   useEffect(() => {
-    if (isRunning && !isPaused) {
-      intervalRef.current = setInterval(() => setSeconds((s) => s + 1), 1000);
-    } else if (intervalRef.current) clearInterval(intervalRef.current);
-    return () => { if (intervalRef.current) clearInterval(intervalRef.current); };
-  }, [isRunning, isPaused]);
-
-  // Offline: pause after 2 min, auto-complete after 1 hour offline
-  useEffect(() => {
-    let autoCompleteTimer: NodeJS.Timeout | null = null;
-
-    const handleOffline = () => {
+    const onOffline = () => {
       setIsOffline(true);
-      if (offlineTimerRef.current) clearTimeout(offlineTimerRef.current);
-      if (autoCompleteTimer) clearTimeout(autoCompleteTimer);
+      if (offlinePauseRef.current) clearTimeout(offlinePauseRef.current);
+      if (offlineCompleteRef.current) clearTimeout(offlineCompleteRef.current);
 
-      // Pause after 2 minutes offline
-      offlineTimerRef.current = setTimeout(async () => {
-        if (!navigator.onLine && isRunning && !isPaused) {
+      // Pause after 2 min without network
+      offlinePauseRef.current = setTimeout(() => {
+        if (!navigator.onLine && timerRef.current && !timerRef.current.isPaused) {
+          const t = timerRef.current;
+          t.isPaused = true;
+          t.pausedAt = Date.now();
+          t.pauseReason = "internet";
+          timerRef.current = t;
+          saveTimer(t);
           setIsPaused(true);
-          pauseReasonRef.current = "internet";
-          setStatusText("No internet — timer paused");
+          setStatusText("No internet — paused");
           showToast("No internet — timer paused");
-          if (sessionId) {
-            await supabase.from("session_pauses").insert({ session_id: sessionId, paused_at: new Date().toISOString() });
+          playSound("pause");
+          if (t.sessionId) {
+            supabase.from("session_pauses").insert({
+              session_id: t.sessionId,
+              paused_at: new Date().toISOString(),
+            });
           }
         }
       }, 2 * 60 * 1000);
 
       // Auto-complete after 1 hour offline
-      autoCompleteTimer = setTimeout(async () => {
-        if (!navigator.onLine && isRunning && sessionId) {
-          await supabase
-            .from("work_sessions")
-            .update({ ended_at: new Date().toISOString(), status: "completed" })
-            .eq("id", sessionId);
+      offlineCompleteRef.current = setTimeout(async () => {
+        if (!navigator.onLine && timerRef.current) {
+          const t = timerRef.current;
+          await supabase.from("work_sessions").update({
+            ended_at: new Date().toISOString(),
+            status: "completed",
+          }).eq("id", t.sessionId);
+          timerRef.current = null;
+          saveTimer(null);
           setIsRunning(false);
           setIsPaused(false);
           setSessionId(null);
           setSeconds(0);
-          setStatusText("Session auto-completed (offline 1h)");
-          showToast("Session auto-completed after 1 hour offline");
-          pauseReasonRef.current = null;
+          setStatusText("Auto-completed (offline 1h)");
+          showToast("Session auto-completed after 1h offline");
         }
       }, 60 * 60 * 1000);
     };
 
-    const handleOnline = async () => {
+    const onOnline = async () => {
       setIsOffline(false);
-      if (offlineTimerRef.current) { clearTimeout(offlineTimerRef.current); offlineTimerRef.current = null; }
-      if (autoCompleteTimer) { clearTimeout(autoCompleteTimer); autoCompleteTimer = null; }
-      if (isRunning && isPaused && pauseReasonRef.current === "internet") {
+      if (offlinePauseRef.current) clearTimeout(offlinePauseRef.current);
+      if (offlineCompleteRef.current) clearTimeout(offlineCompleteRef.current);
+
+      if (timerRef.current?.isPaused && timerRef.current.pauseReason === "internet") {
+        const t = timerRef.current;
+        if (t.pausedAt) t.totalPausedMs += Date.now() - t.pausedAt;
+        t.pausedAt = null;
+        t.isPaused = false;
+        t.pauseReason = null;
+        timerRef.current = t;
+        saveTimer(t);
         setIsPaused(false);
-        pauseReasonRef.current = null;
-        setStatusText("Connection restored");
+        setStatusText("Working...");
         showToast("Connection restored — timer resumed");
-        if (sessionId) {
-          const { data } = await supabase.from("session_pauses").select("*").eq("session_id", sessionId).is("resumed_at", null).order("paused_at", { ascending: false }).limit(1);
-          if (data?.[0]) await supabase.from("session_pauses").update({ resumed_at: new Date().toISOString() }).eq("id", data[0].id);
+        playSound("start");
+        if (t.sessionId) {
+          const { data } = await supabase
+            .from("session_pauses")
+            .select("*")
+            .eq("session_id", t.sessionId)
+            .is("resumed_at", null)
+            .order("paused_at", { ascending: false })
+            .limit(1);
+          if (data?.[0]) {
+            await supabase.from("session_pauses").update({ resumed_at: new Date().toISOString() }).eq("id", data[0].id);
+          }
         }
       }
     };
-    setIsOffline(!navigator.onLine);
-    window.addEventListener("offline", handleOffline);
-    window.addEventListener("online", handleOnline);
-    return () => {
-      window.removeEventListener("offline", handleOffline);
-      window.removeEventListener("online", handleOnline);
-      if (offlineTimerRef.current) clearTimeout(offlineTimerRef.current);
-      if (autoCompleteTimer) clearTimeout(autoCompleteTimer);
-    };
-  }, [isRunning, isPaused, sessionId]);
 
-  // 30 min reminder
+    setIsOffline(!navigator.onLine);
+    window.addEventListener("offline", onOffline);
+    window.addEventListener("online", onOnline);
+    return () => {
+      window.removeEventListener("offline", onOffline);
+      window.removeEventListener("online", onOnline);
+      if (offlinePauseRef.current) clearTimeout(offlinePauseRef.current);
+      if (offlineCompleteRef.current) clearTimeout(offlineCompleteRef.current);
+    };
+  }, []);
+
+  // 30-min reminder
   useEffect(() => {
     if (isRunning && !isPaused) {
-      reminderTimerRef.current = setInterval(() => {
+      reminderRef.current = setInterval(() => {
         showToast("Timer is still running");
         playSound("notify");
       }, 30 * 60 * 1000);
-    } else if (reminderTimerRef.current) clearInterval(reminderTimerRef.current);
-    return () => { if (reminderTimerRef.current) clearInterval(reminderTimerRef.current); };
+    }
+    return () => { if (reminderRef.current) clearInterval(reminderRef.current); };
   }, [isRunning, isPaused]);
 
   const formatTime = (total: number) => {
     const h = Math.floor(total / 3600);
     const m = Math.floor((total % 3600) / 60);
     const s = total % 60;
-    return `${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}`;
+    return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
   };
-  const formatDateTime = (d: Date) => d.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+  const formatDateTime = (d: Date) =>
+    d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
 
   const handleStart = async () => {
     if (!user) return;
 
-    // Close any stuck running sessions for this employee
+    // Close stuck running sessions
     const { data: stuck } = await supabase
       .from("work_sessions")
       .select("id")
       .eq("employee_id", user.id)
       .eq("status", "running");
-    if (stuck && stuck.length > 0) {
+    if (stuck) {
       for (const s of stuck) {
-        await supabase
-          .from("work_sessions")
-          .update({ ended_at: new Date().toISOString(), status: "completed" })
-          .eq("id", s.id);
+        await supabase.from("work_sessions").update({
+          ended_at: new Date().toISOString(),
+          status: "completed",
+        }).eq("id", s.id);
       }
     }
 
     const { data, error } = await supabase.from("work_sessions").insert({
-      employee_id: user.id, started_at: new Date().toISOString(), status: "running"
+      employee_id: user.id,
+      started_at: new Date().toISOString(),
+      status: "running",
     }).select().single();
-    if (error) { setStatusText("Error"); return; }
+    if (error) { setStatusText("Error starting"); return; }
+
+    const t: SavedTimer = {
+      sessionId: data.id,
+      startedAt: Date.now(),
+      totalPausedMs: 0,
+      pausedAt: null,
+      isPaused: false,
+      pauseReason: null,
+    };
+    timerRef.current = t;
+    saveTimer(t);
     setSessionId(data.id);
-    setIsRunning(true); setIsPaused(false); setSeconds(0);
+    setIsRunning(true);
+    setIsPaused(false);
+    setSeconds(0);
     setStatusText("Working...");
-    pauseReasonRef.current = null;
     playSound("start");
     showToast("Timer started");
   };
 
   const handlePause = async () => {
-    if (!sessionId) return;
-    setIsPaused(true); pauseReasonRef.current = "manual"; setStatusText("Paused");
-    await supabase.from("session_pauses").insert({ session_id: sessionId, paused_at: new Date().toISOString() });
+    if (!timerRef.current) return;
+    const t = timerRef.current;
+    t.isPaused = true;
+    t.pausedAt = Date.now();
+    t.pauseReason = "manual";
+    timerRef.current = t;
+    saveTimer(t);
+    setIsPaused(true);
+    setStatusText("Paused");
+    playSound("pause");
+    showToast("Timer paused");
+    await supabase.from("session_pauses").insert({
+      session_id: t.sessionId,
+      paused_at: new Date().toISOString(),
+    });
   };
 
   const handleResume = async () => {
-    if (!sessionId) return;
-    setIsPaused(false); pauseReasonRef.current = null; setStatusText("Working...");
-    const { data } = await supabase.from("session_pauses").select("*").eq("session_id", sessionId).is("resumed_at", null).order("paused_at", { ascending: false }).limit(1);
-    if (data?.[0]) await supabase.from("session_pauses").update({ resumed_at: new Date().toISOString() }).eq("id", data[0].id);
+    if (!timerRef.current) return;
+    const t = timerRef.current;
+    if (t.pausedAt) t.totalPausedMs += Date.now() - t.pausedAt;
+    t.pausedAt = null;
+    t.isPaused = false;
+    t.pauseReason = null;
+    timerRef.current = t;
+    saveTimer(t);
+    setIsPaused(false);
+    setStatusText("Working...");
+    playSound("start");
+    showToast("Timer resumed");
+    const { data } = await supabase
+      .from("session_pauses")
+      .select("*")
+      .eq("session_id", t.sessionId)
+      .is("resumed_at", null)
+      .order("paused_at", { ascending: false })
+      .limit(1);
+    if (data?.[0]) {
+      await supabase.from("session_pauses").update({ resumed_at: new Date().toISOString() }).eq("id", data[0].id);
+    }
   };
 
   const handleStopClick = () => {
     setShowActivityModal(true);
-    setExpandedCategory(null); setSelectedNames([]); setOtherText("");
+    setExpandedCategory(null);
+    setSelectedNames([]);
+    setOtherText("");
   };
 
   const toggleName = (name: string) => {
-    setSelectedNames(prev => prev.includes(name) ? prev.filter(n => n !== name) : [...prev, name]);
+    setSelectedNames((prev) =>
+      prev.includes(name) ? prev.filter((n) => n !== name) : [...prev, name]
+    );
   };
 
   const handleConfirmActivities = async () => {
     if (!sessionId) return;
-
-    // Unique activities only
-    const uniqueNames = [...new Set(selectedNames)];
-    // Clear any previous activities for this session first
+    const unique = [...new Set(selectedNames)];
     await supabase.from("session_activities").delete().eq("session_id", sessionId);
-
-    for (const name of uniqueNames) {
+    for (const name of unique) {
       if (name === "Other") continue;
-      const found = activities.find(a => a.name === name);
+      const found = activities.find((a) => a.name === name);
       if (found) {
         await supabase.from("session_activities").insert({
           session_id: sessionId,
@@ -347,7 +515,7 @@ export default function TimerPage() {
         });
       }
     }
-    if (uniqueNames.includes("Other") && otherText.trim()) {
+    if (unique.includes("Other") && otherText.trim()) {
       await supabase.from("session_activities").insert({
         session_id: sessionId,
         custom_text: otherText.trim(),
@@ -355,37 +523,38 @@ export default function TimerPage() {
     }
 
     const { data: session } = await supabase.from("work_sessions").select("*").eq("id", sessionId).single();
-    const { data: pausesData } = await supabase.from("session_pauses").select("*").eq("session_id", sessionId).order("paused_at");
     if (session) {
       const start = new Date(session.started_at);
       const end = new Date();
-      setSessionStart(start); setSessionEnd(end); setPauses(pausesData || []);
-      setAdjustStart(formatDateTime(start)); setAdjustEnd(formatDateTime(end));
+      setSessionStart(start);
+      setSessionEnd(end);
+      setAdjustStart(formatDateTime(start));
+      setAdjustEnd(formatDateTime(end));
     }
-    setShowActivityModal(false); setShowTimeModal(true);
+    setShowActivityModal(false);
+    setShowTimeModal(true);
   };
 
   const handleFinalSave = async () => {
     if (!sessionId || !sessionStart || !sessionEnd || !user) return;
     const [sh, sm] = adjustStart.split(":").map(Number);
     const [eh, em] = adjustEnd.split(":").map(Number);
-    const newStart = new Date(sessionStart); newStart.setHours(sh, sm, 0, 0);
-    const newEnd = new Date(sessionEnd); newEnd.setHours(eh, em, 0, 0);
+    const newStart = new Date(sessionStart);
+    newStart.setHours(sh, sm, 0, 0);
+    const newEnd = new Date(sessionEnd);
+    newEnd.setHours(eh, em, 0, 0);
 
-    // ±5 minutes tolerance
-    const TOLERANCE_MS = 5 * 60 * 1000;
-    const minStart = new Date(sessionStart.getTime() - TOLERANCE_MS);
-    const maxEnd = new Date(sessionEnd.getTime() + TOLERANCE_MS);
-
-    if (newStart < minStart || newEnd > maxEnd || newStart >= newEnd) {
+    const TOL = 5 * 60 * 1000;
+    if (newStart < new Date(sessionStart.getTime() - TOL) ||
+        newEnd > new Date(sessionEnd.getTime() + TOL) ||
+        newStart >= newEnd) {
       alert("Time must be within ±5 minutes of the real session");
       return;
     }
 
-    // Check for overlapping sessions (same employee, same day, overlapping hours)
+    // Auto-merge overlapping sessions instead of error
     const dayStart = new Date(newStart); dayStart.setHours(0, 0, 0, 0);
     const dayEnd = new Date(newStart); dayEnd.setHours(23, 59, 59, 999);
-
     const { data: existing } = await supabase
       .from("work_sessions")
       .select("id, started_at, ended_at")
@@ -395,64 +564,143 @@ export default function TimerPage() {
       .gte("started_at", dayStart.toISOString())
       .lte("started_at", dayEnd.toISOString());
 
+    let finalStart = newStart;
+    let finalEnd = newEnd;
+    const mergeIds: string[] = [];
+
     if (existing) {
       for (const s of existing) {
         if (!s.ended_at) continue;
         const sStart = new Date(s.started_at).getTime();
         const sEnd = new Date(s.ended_at).getTime();
-        const nStart = newStart.getTime();
-        const nEnd = newEnd.getTime();
-        // Overlap if ranges intersect
-        if (nStart < sEnd && nEnd > sStart) {
-          alert("This time overlaps with another session on the same day. One hour can only be registered once.");
-          return;
+        if (finalStart.getTime() < sEnd && finalEnd.getTime() > sStart) {
+          // Overlap → merge
+          mergeIds.push(s.id);
+          if (sStart < finalStart.getTime()) finalStart = new Date(s.started_at);
+          if (sEnd > finalEnd.getTime()) finalEnd = new Date(s.ended_at);
         }
       }
     }
+
+    // Move unique activities from merged sessions into current
+    for (const mid of mergeIds) {
+      const { data: oldActs } = await supabase
+        .from("session_activities")
+        .select("activity_type_id, custom_text")
+        .eq("session_id", mid);
+      if (oldActs) {
+        for (const a of oldActs) {
+          // Check if already exists on current session
+          let q = supabase.from("session_activities").select("id").eq("session_id", sessionId);
+          if (a.activity_type_id) {
+            const { data: dup } = await q.eq("activity_type_id", a.activity_type_id).limit(1);
+            if (!dup || dup.length === 0) {
+              await supabase.from("session_activities").insert({
+                session_id: sessionId,
+                activity_type_id: a.activity_type_id,
+                custom_text: a.custom_text,
+              });
+            }
+          } else if (a.custom_text) {
+            const { data: dup } = await supabase
+              .from("session_activities")
+              .select("id")
+              .eq("session_id", sessionId)
+              .eq("custom_text", a.custom_text)
+              .limit(1);
+            if (!dup || dup.length === 0) {
+              await supabase.from("session_activities").insert({
+                session_id: sessionId,
+                custom_text: a.custom_text,
+              });
+            }
+          }
+        }
+      }
+      // Delete old session
+      await supabase.from("session_activities").delete().eq("session_id", mid);
+      await supabase.from("session_pauses").delete().eq("session_id", mid);
+      await supabase.from("work_sessions").delete().eq("id", mid);
+    }
+
     await supabase.from("work_sessions").update({
-      started_at: newStart.toISOString(), ended_at: newEnd.toISOString(), status: "completed",
-      custom_note: selectedNames.includes("Other") ? otherText.trim() : null
+      started_at: finalStart.toISOString(),
+      ended_at: finalEnd.toISOString(),
+      status: "completed",
+      custom_note: selectedNames.includes("Other") ? otherText.trim() : null,
     }).eq("id", sessionId);
 
-    setIsRunning(false); setIsPaused(false); setStatusText("Session finished");
-    setShowTimeModal(false); setSessionId(null); setSeconds(0);
-    playSound("stop"); showToast("Session saved");
+    timerRef.current = null;
+    saveTimer(null);
+    setIsRunning(false);
+    setIsPaused(false);
+    setSessionId(null);
+    setSeconds(0);
+    setShowTimeModal(false);
+    setStatusText(mergeIds.length > 0 ? "Session saved (merged)" : "Session finished");
+    playSound("stop");
+    showToast(mergeIds.length > 0 ? "Session saved & merged with overlap" : "Session saved");
+  };
+
+  const handleRecoveryYes = () => {
+    if (!recoverySession) return;
+    setSessionId(recoverySession.id);
+    setSessionStart(new Date(recoverySession.started_at));
+    setSessionEnd(new Date(recoverySession.ended_at));
+    setAdjustStart(formatDateTime(new Date(recoverySession.started_at)));
+    setAdjustEnd(formatDateTime(new Date(recoverySession.ended_at)));
+    setShowRecovery(false);
+    setShowActivityModal(true);
+  };
+
+  const handleRecoverySkip = () => {
+    setShowRecovery(false);
+    setRecoverySession(null);
   };
 
   const handleLogout = () => {
+    // Don't clear timer — just logout UI session
     localStorage.removeItem("timeglass_user");
     router.push("/");
   };
 
-  if (!user) return <div className="h-full flex items-center justify-center"><p className="text-white/40">Loading...</p></div>;
+  if (!user) {
+    return (
+      <div className="h-full flex items-center justify-center">
+        <p className="text-white/40">Loading...</p>
+      </div>
+    );
+  }
 
   return (
     <div className="h-full flex flex-col px-4 relative overflow-hidden">
-      {/* Offline banner */}
       {isOffline && (
-        <div className="absolute top-0 left-0 right-0 z-50 py-2.5 text-center text-sm font-medium" style={{ background: "rgba(239,68,68,0.9)" }}>
+        <div className="absolute top-0 left-0 right-0 z-50 py-2.5 text-center text-sm font-medium"
+          style={{ background: "rgba(239,68,68,0.9)" }}>
           No internet connection
         </div>
       )}
 
-      {/* Toast bottom-right */}
       {toast && (
-        <div 
-          className="absolute bottom-6 right-4 z-50 px-4 py-3 rounded-xl text-sm max-w-[240px] shadow-lg"
-          style={{ background: "rgba(20,20,30,0.95)", border: "1px solid rgba(255,255,255,0.12)", backdropFilter: "blur(12px)" }}
-        >
+        <div className="absolute bottom-6 right-4 z-50 px-4 py-3 rounded-xl text-sm max-w-[240px]"
+          style={{ background: "rgba(20,20,30,0.95)", border: "1px solid rgba(255,255,255,0.12)", backdropFilter: "blur(12px)" }}>
           {toast}
         </div>
       )}
 
-      {/* Glows */}
       <div className="absolute w-48 h-48 rounded-full pointer-events-none" style={{
-        top: "5%", left: "-12%", background: "radial-gradient(circle, rgba(124,58,237,0.3) 0%, transparent 70%)",
-        filter: "blur(35px)", transform: `translate(${mouse.x*0.5}px,${mouse.y*0.5}px)`, transition: "transform 0.12s ease-out"
+        top: "5%", left: "-12%",
+        background: "radial-gradient(circle, rgba(124,58,237,0.3) 0%, transparent 70%)",
+        filter: "blur(35px)",
+        transform: `translate(${mouse.x * 0.5}px,${mouse.y * 0.5}px)`,
+        transition: "transform 0.12s ease-out",
       }} />
       <div className="absolute w-56 h-56 rounded-full pointer-events-none" style={{
-        bottom: "8%", right: "-15%", background: "radial-gradient(circle, rgba(6,182,212,0.25) 0%, transparent 70%)",
-        filter: "blur(45px)", transform: `translate(${mouse.x*-0.4}px,${mouse.y*-0.4}px)`, transition: "transform 0.12s ease-out"
+        bottom: "8%", right: "-15%",
+        background: "radial-gradient(circle, rgba(6,182,212,0.25) 0%, transparent 70%)",
+        filter: "blur(45px)",
+        transform: `translate(${mouse.x * -0.4}px,${mouse.y * -0.4}px)`,
+        transition: "transform 0.12s ease-out",
       }} />
 
       {/* Header */}
@@ -461,13 +709,17 @@ export default function TimerPage() {
           <p className="text-white/30 text-[10px] uppercase tracking-widest">Welcome</p>
           <p className="font-medium text-[15px]">{user.name}</p>
         </div>
-        <div className="flex gap-2">
-          <button onClick={() => router.push("/calendar")} className="text-xs px-2.5 py-1.5 rounded-lg" style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.08)" }}>Calendar</button>
-          <button onClick={() => window.open("/board", "_blank")} className="text-xs px-2.5 py-1.5 rounded-lg" style={{ background: "rgba(6,182,212,0.15)", border: "1px solid rgba(6,182,212,0.3)" }}>Board</button>
+        <div className="flex gap-1.5 flex-wrap justify-end">
+          <button onClick={() => router.push("/calendar")} className="text-xs px-2.5 py-1.5 rounded-lg"
+            style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.08)" }}>Calendar</button>
+          <button onClick={() => window.open("/board", "_blank")} className="text-xs px-2.5 py-1.5 rounded-lg"
+            style={{ background: "rgba(6,182,212,0.15)", border: "1px solid rgba(6,182,212,0.3)" }}>Board</button>
           {user.role === "admin" && (
-            <button onClick={() => router.push("/admin")} className="text-xs px-2.5 py-1.5 rounded-lg" style={{ background: "rgba(124,58,237,0.2)", border: "1px solid rgba(124,58,237,0.35)" }}>Admin</button>
+            <button onClick={() => router.push("/admin")} className="text-xs px-2.5 py-1.5 rounded-lg"
+              style={{ background: "rgba(124,58,237,0.2)", border: "1px solid rgba(124,58,237,0.35)" }}>Admin</button>
           )}
-          <button onClick={handleLogout} className="text-xs px-2.5 py-1.5 rounded-lg text-white/50" style={{ background: "rgba(255,255,255,0.04)" }}>Logout</button>
+          <button onClick={handleLogout} className="text-xs px-2.5 py-1.5 rounded-lg text-white/50"
+            style={{ background: "rgba(255,255,255,0.04)" }}>Logout</button>
         </div>
       </div>
 
@@ -478,37 +730,44 @@ export default function TimerPage() {
           { label: "Week", value: hoursWeek },
           { label: "Month", value: hoursMonth },
         ].map((s) => (
-          <div key={s.label} className="rounded-xl py-2.5 text-center" style={{ background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.06)" }}>
+          <div key={s.label} className="rounded-xl py-2.5 text-center"
+            style={{ background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.06)" }}>
             <p className="text-white/30 text-[10px] uppercase tracking-wider">{s.label}</p>
             <p className="text-sm font-medium mt-0.5">{s.value.toFixed(1)}h</p>
           </div>
         ))}
       </div>
 
-      {/* Timer card */}
+      {/* Timer */}
       <div className="flex-1 flex flex-col items-center justify-center relative z-10">
         <div className="w-full max-w-sm rounded-3xl p-7 text-center space-y-7" style={{
-          background: "rgba(255,255,255,0.055)", backdropFilter: "blur(24px)",
+          background: "rgba(255,255,255,0.055)",
+          backdropFilter: "blur(24px)",
           border: "1px solid rgba(255,255,255,0.1)",
           boxShadow: "0 25px 50px rgba(0,0,0,0.45), inset 0 1px 0 rgba(255,255,255,0.06)",
-          transform: `perspective(900px) rotateY(${mouse.x*0.06}deg) rotateX(${-mouse.y*0.06}deg)`,
-          transition: "transform 0.15s ease-out"
+          transform: `perspective(900px) rotateY(${mouse.x * 0.06}deg) rotateX(${-mouse.y * 0.06}deg)`,
+          transition: "transform 0.15s ease-out",
         }}>
           <p className="text-white/40 text-xs uppercase tracking-[0.2em]">{statusText}</p>
-          <div className="text-5xl font-light tabular-nums" style={{ letterSpacing: "-0.04em" }}>{formatTime(seconds)}</div>
+          <div className="text-5xl font-light tabular-nums" style={{ letterSpacing: "-0.04em" }}>
+            {formatTime(seconds)}
+          </div>
           <div className="flex gap-3 justify-center">
             {!isRunning ? (
-              <button onClick={handleStart} className="px-10 py-3.5 rounded-2xl font-medium text-[15px] active:scale-95 transition-transform"
+              <button onClick={handleStart}
+                className="px-10 py-3.5 rounded-2xl font-medium text-[15px] active:scale-95 transition-transform"
                 style={{ background: "linear-gradient(135deg, #7c3aed 0%, #06b6d4 100%)", boxShadow: "0 8px 24px rgba(124,58,237,0.35)" }}>
                 Start
               </button>
             ) : (
               <>
-                <button onClick={isPaused ? handleResume : handlePause} className="px-7 py-3.5 rounded-2xl font-medium text-[15px] active:scale-95"
+                <button onClick={isPaused ? handleResume : handlePause}
+                  className="px-7 py-3.5 rounded-2xl font-medium text-[15px] active:scale-95"
                   style={{ background: "rgba(255,255,255,0.08)", border: "1px solid rgba(255,255,255,0.12)" }}>
                   {isPaused ? "Resume" : "Pause"}
                 </button>
-                <button onClick={handleStopClick} className="px-7 py-3.5 rounded-2xl font-medium text-[15px] active:scale-95"
+                <button onClick={handleStopClick}
+                  className="px-7 py-3.5 rounded-2xl font-medium text-[15px] active:scale-95"
                   style={{ background: "rgba(239,68,68,0.15)", border: "1px solid rgba(239,68,68,0.3)", color: "#fca5a5" }}>
                   Stop
                 </button>
@@ -518,28 +777,73 @@ export default function TimerPage() {
         </div>
       </div>
 
-      <div className="text-center text-white/20 text-xs pb-5 relative z-10">TimeGlass • {user.role === "admin" ? "Admin" : "Employee"}</div>
+      <div className="text-center text-white/20 text-xs pb-5 relative z-10">
+        TimeGlass · {user.role === "admin" ? "Admin" : "Employee"}
+      </div>
 
-      {/* Activity Modal + Time Modal - same as before, abbreviated for space */}
+      {/* Interrupted session recovery */}
+      {showRecovery && recoverySession && (
+        <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/70 px-5"
+          style={{ backdropFilter: "blur(8px)" }}>
+          <div className="w-full max-w-sm rounded-3xl p-6 space-y-4"
+            style={{ background: "rgba(18,18,26,0.98)", border: "1px solid rgba(255,255,255,0.1)" }}>
+            <h2 className="text-lg font-medium text-center">Interrupted session</h2>
+            <p className="text-white/50 text-sm text-center leading-relaxed">
+              Your previous session ran from{" "}
+              <span className="text-white/80">
+                {new Date(recoverySession.started_at).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}
+              </span>
+              {" "}to{" "}
+              <span className="text-white/80">
+                {new Date(recoverySession.ended_at).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}
+              </span>
+              {" "}and ended unexpectedly.
+            </p>
+            <p className="text-white/40 text-xs text-center">
+              Would you like to specify what you worked on?
+            </p>
+            <div className="flex gap-3 pt-2">
+              <button onClick={handleRecoverySkip} className="flex-1 py-3 rounded-xl text-sm"
+                style={{ background: "rgba(255,255,255,0.07)" }}>Skip</button>
+              <button onClick={handleRecoveryYes} className="flex-1 py-3 rounded-xl text-sm font-medium"
+                style={{ background: "linear-gradient(135deg, #7c3aed 0%, #06b6d4 100%)" }}>
+                Yes, add activity
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Activity Modal */}
       {showActivityModal && (
-        <div className="absolute inset-0 z-50 flex items-end justify-center bg-black/70" style={{ backdropFilter: "blur(8px)" }}
+        <div className="absolute inset-0 z-50 flex items-end justify-center bg-black/70"
+          style={{ backdropFilter: "blur(8px)" }}
           onClick={(e) => { if (e.target === e.currentTarget) setShowActivityModal(false); }}>
-          <div className="w-full max-w-md rounded-t-3xl p-6 flex flex-col" style={{ background: "rgba(18,18,26,0.98)", border: "1px solid rgba(255,255,255,0.1)", maxHeight: "85vh" }}
+          <div className="w-full max-w-md rounded-t-3xl p-6 flex flex-col"
+            style={{ background: "rgba(18,18,26,0.98)", border: "1px solid rgba(255,255,255,0.1)", maxHeight: "85vh" }}
             onClick={(e) => e.stopPropagation()}>
             <div className="text-center mb-4"><h2 className="text-lg font-medium">What did you work on?</h2></div>
             <div className="space-y-2 overflow-y-auto" style={{ maxHeight: "50vh", overscrollBehavior: "contain" }}>
               {CATEGORIES.map((cat) => (
                 <div key={cat.id}>
-                  <button onClick={() => cat.children ? setExpandedCategory(expandedCategory === cat.id ? null : cat.id) : toggleName(cat.name)}
+                  <button
+                    onClick={() => cat.children
+                      ? setExpandedCategory(expandedCategory === cat.id ? null : cat.id)
+                      : toggleName(cat.name)}
                     className="w-full text-left px-4 py-3.5 rounded-xl flex justify-between"
-                    style={{ background: selectedNames.includes(cat.name) || (cat.children && cat.children.some(c => selectedNames.includes(c))) ? "rgba(124,58,237,0.28)" : "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.08)" }}>
+                    style={{
+                      background: selectedNames.includes(cat.name) || (cat.children && cat.children.some((c) => selectedNames.includes(c)))
+                        ? "rgba(124,58,237,0.28)" : "rgba(255,255,255,0.05)",
+                      border: "1px solid rgba(255,255,255,0.08)",
+                    }}>
                     <span>{cat.name}</span>
                     {cat.children && <span className="text-white/40">{expandedCategory === cat.id ? "▲" : "▼"}</span>}
                   </button>
                   {cat.children && expandedCategory === cat.id && (
                     <div className="ml-3 mt-1.5 space-y-1.5 border-l border-white/10 pl-3">
                       {cat.children.map((c) => (
-                        <button key={c} onClick={() => toggleName(c)} className="w-full text-left px-3 py-2.5 rounded-lg text-sm"
+                        <button key={c} onClick={() => toggleName(c)}
+                          className="w-full text-left px-3 py-2.5 rounded-lg text-sm"
                           style={{ background: selectedNames.includes(c) ? "rgba(124,58,237,0.25)" : "rgba(255,255,255,0.04)" }}>
                           {c.replace(/^Ticket (Review|Work) — /, "")}
                         </button>
@@ -550,40 +854,52 @@ export default function TimerPage() {
               ))}
             </div>
             {selectedNames.includes("Other") && (
-              <input value={otherText} onChange={(e) => setOtherText(e.target.value)} placeholder="Describe..." className="w-full mt-3 px-4 py-3 rounded-xl outline-none text-sm"
+              <input value={otherText} onChange={(e) => setOtherText(e.target.value)}
+                placeholder="Describe..." className="w-full mt-3 px-4 py-3 rounded-xl outline-none text-sm"
                 style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)" }} />
             )}
             <div className="flex gap-3 pt-5">
-              <button onClick={() => setShowActivityModal(false)} className="flex-1 py-3.5 rounded-xl text-sm" style={{ background: "rgba(255,255,255,0.07)" }}>Cancel</button>
-              <button onClick={handleConfirmActivities} disabled={selectedNames.length === 0} className="flex-1 py-3.5 rounded-xl text-sm font-medium disabled:opacity-40"
+              <button onClick={() => setShowActivityModal(false)} className="flex-1 py-3.5 rounded-xl text-sm"
+                style={{ background: "rgba(255,255,255,0.07)" }}>Cancel</button>
+              <button onClick={handleConfirmActivities} disabled={selectedNames.length === 0}
+                className="flex-1 py-3.5 rounded-xl text-sm font-medium disabled:opacity-40"
                 style={{ background: "linear-gradient(135deg, #7c3aed 0%, #06b6d4 100%)" }}>Next</button>
             </div>
           </div>
         </div>
       )}
 
+      {/* Time adjust modal */}
       {showTimeModal && sessionStart && sessionEnd && (
         <div className="absolute inset-0 z-50 flex items-end justify-center bg-black/70" style={{ backdropFilter: "blur(8px)" }}>
-          <div className="w-full max-w-md rounded-t-3xl p-6" style={{ background: "rgba(18,18,26,0.98)", border: "1px solid rgba(255,255,255,0.1)" }}>
+          <div className="w-full max-w-md rounded-t-3xl p-6"
+            style={{ background: "rgba(18,18,26,0.98)", border: "1px solid rgba(255,255,255,0.1)" }}>
             <div className="text-center mb-5">
               <h2 className="text-lg font-medium">Adjust work time</h2>
-              <p className="text-white/40 text-sm mt-1">{formatDateTime(sessionStart)} — {formatDateTime(sessionEnd)}</p>
+              <p className="text-white/40 text-sm mt-1">
+                {formatDateTime(sessionStart)} — {formatDateTime(sessionEnd)} (±5 min)
+              </p>
             </div>
             <div className="space-y-4">
               <div>
                 <label className="text-white/50 text-xs uppercase">From</label>
-                <input type="time" value={adjustStart} onChange={(e) => setAdjustStart(e.target.value)} className="w-full mt-1.5 px-4 py-3.5 rounded-xl outline-none text-lg"
+                <input type="time" value={adjustStart} onChange={(e) => setAdjustStart(e.target.value)}
+                  className="w-full mt-1.5 px-4 py-3.5 rounded-xl outline-none text-lg"
                   style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)" }} />
               </div>
               <div>
                 <label className="text-white/50 text-xs uppercase">To</label>
-                <input type="time" value={adjustEnd} onChange={(e) => setAdjustEnd(e.target.value)} className="w-full mt-1.5 px-4 py-3.5 rounded-xl outline-none text-lg"
+                <input type="time" value={adjustEnd} onChange={(e) => setAdjustEnd(e.target.value)}
+                  className="w-full mt-1.5 px-4 py-3.5 rounded-xl outline-none text-lg"
                   style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)" }} />
               </div>
             </div>
             <div className="flex gap-3 pt-5">
-              <button onClick={() => { setShowTimeModal(false); setShowActivityModal(true); }} className="flex-1 py-3.5 rounded-xl text-sm" style={{ background: "rgba(255,255,255,0.07)" }}>Back</button>
-              <button onClick={handleFinalSave} className="flex-1 py-3.5 rounded-xl text-sm font-medium" style={{ background: "linear-gradient(135deg, #7c3aed 0%, #06b6d4 100%)" }}>Save Session</button>
+              <button onClick={() => { setShowTimeModal(false); setShowActivityModal(true); }}
+                className="flex-1 py-3.5 rounded-xl text-sm" style={{ background: "rgba(255,255,255,0.07)" }}>Back</button>
+              <button onClick={handleFinalSave}
+                className="flex-1 py-3.5 rounded-xl text-sm font-medium"
+                style={{ background: "linear-gradient(135deg, #7c3aed 0%, #06b6d4 100%)" }}>Save Session</button>
             </div>
           </div>
         </div>

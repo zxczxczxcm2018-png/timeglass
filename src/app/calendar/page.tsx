@@ -276,6 +276,15 @@ export default function CalendarPage() {
           custom_note: formNote || null,
         })
         .eq("id", editingSession.id);
+
+      // Update activity if selected
+      if (formActivity) {
+        await supabase.from("session_activities").delete().eq("session_id", editingSession.id);
+        await supabase.from("session_activities").insert({
+          session_id: editingSession.id,
+          activity_type_id: formActivity,
+        });
+      }
     } else {
       const { data: newSess } = await supabase
         .from("work_sessions")
@@ -551,18 +560,17 @@ export default function CalendarPage() {
               </div>
             </div>
 
-            {!editingSession && (
-              <div>
-                <label className="text-white/40 text-xs uppercase">Activity</label>
-                <select value={formActivity} onChange={(e) => setFormActivity(e.target.value)}
-                  className="w-full mt-1 px-3 py-2.5 rounded-xl text-sm outline-none"
-                  style={{ background: "#1a1a24", color: "#fff", border: "1px solid rgba(255,255,255,0.15)" }}>
-                  {activities.map((a) => (
-                    <option key={a.id} value={a.id} style={{ background: "#1a1a24", color: "#fff" }}>{a.name}</option>
-                  ))}
-                </select>
-              </div>
-            )}
+            <div>
+              <label className="text-white/40 text-xs uppercase">Activity</label>
+              <select value={formActivity} onChange={(e) => setFormActivity(e.target.value)}
+                className="w-full mt-1 px-3 py-2.5 rounded-xl text-sm outline-none"
+                style={{ background: "#1a1a24", color: "#fff", border: "1px solid rgba(255,255,255,0.15)" }}>
+                <option value="" style={{ background: "#1a1a24", color: "#fff" }}>— keep current —</option>
+                {activities.map((a) => (
+                  <option key={a.id} value={a.id} style={{ background: "#1a1a24", color: "#fff" }}>{a.name}</option>
+                ))}
+              </select>
+            </div>
 
             <div>
               <label className="text-white/40 text-xs uppercase">Note</label>
