@@ -24,6 +24,7 @@ type Session = {
   status: string;
   custom_note: string | null;
   is_paid: boolean;
+  is_disputed?: boolean;
   employees?: { name: string };
   session_activities?: {
     id?: string;
@@ -92,7 +93,7 @@ export default function CalendarPage() {
     let query = supabase
       .from("work_sessions")
       .select(`
-        id, employee_id, started_at, ended_at, status, custom_note, is_paid,
+        id, employee_id, started_at, ended_at, status, custom_note, is_paid, is_disputed,
         employees ( name ),
         session_activities ( id, custom_text, activity_types ( name ) )
       `)
@@ -464,6 +465,24 @@ export default function CalendarPage() {
                     >
                       {s.is_paid ? "Paid" : "Unpaid"}
                     </span>
+                  )}
+                  {/* Disputed toggle - admin only */}
+                  {isAdmin && (
+                    <button
+                      onClick={async () => {
+                        const newVal = !s.is_disputed;
+                        await supabase.from("work_sessions").update({ is_disputed: newVal }).eq("id", s.id);
+                        setSessions((prev) => prev.map((x) => x.id === s.id ? { ...x, is_disputed: newVal } : x));
+                      }}
+                      className="text-[10px] px-2 py-0.5 rounded-md font-medium uppercase tracking-wide"
+                      style={{
+                        background: s.is_disputed ? "rgba(245,158,11,0.2)" : "rgba(255,255,255,0.04)",
+                        border: s.is_disputed ? "1px solid rgba(245,158,11,0.4)" : "1px solid rgba(255,255,255,0.08)",
+                        color: s.is_disputed ? "#fbbf24" : "rgba(255,255,255,0.3)"
+                      }}
+                    >
+                      {s.is_disputed ? "Disputed" : "OK"}
+                    </button>
                   )}
                 </div>
               </div>

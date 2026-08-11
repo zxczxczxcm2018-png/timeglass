@@ -37,6 +37,7 @@ export default function LoginPage() {
       .from("employees")
       .select("*")
       .eq("access_code", cleanCode)
+      .eq("is_active", true)
       .single();
 
     if (fetchError || !data) {

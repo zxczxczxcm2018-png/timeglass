@@ -67,6 +67,7 @@ export default function AdminPage() {
     const { data } = await supabase
       .from("employees")
       .select("*")
+      .eq("is_active", true)
       .order("name");
     if (data) setEmployees(data);
     setLoading(false);
@@ -75,16 +76,37 @@ export default function AdminPage() {
   const handleAdd = async () => {
     if (!newName.trim()) return;
     const code = generatedCode || generateCode();
+    const name = newName.trim();
 
-    const { error } = await supabase.from("employees").insert({
-      name: newName.trim(),
-      access_code: code,
-      role: newRole,
-    });
+    // Check if inactive employee with same name exists → reactivate
+    const { data: inactive } = await supabase
+      .from("employees")
+      .select("*")
+      .eq("name", name)
+      .eq("is_active", false)
+      .limit(1);
 
-    if (error) {
-      alert("Error: " + error.message);
-      return;
+    if (inactive && inactive.length > 0) {
+      // Reactivate and update code/role — sessions stay linked
+      await supabase
+        .from("employees")
+        .update({
+          is_active: true,
+          access_code: code,
+          role: newRole,
+        })
+        .eq("id", inactive[0].id);
+    } else {
+      const { error } = await supabase.from("employees").insert({
+        name,
+        access_code: code,
+        role: newRole,
+        is_active: true,
+      });
+      if (error) {
+        alert("Error: " + error.message);
+        return;
+      }
     }
 
     setNewName("");
@@ -94,8 +116,9 @@ export default function AdminPage() {
   };
 
   const handleDelete = async (id: string, name: string) => {
-    if (!confirm(`Delete ${name}?`)) return;
-    await supabase.from("employees").delete().eq("id", id);
+    if (!confirm(`Deactivate ${name}? Their sessions will remain in history.`)) return;
+    // Soft delete — sessions stay under this employee id/name
+    await supabase.from("employees").update({ is_active: false }).eq("id", id);
     loadEmployees();
   };
 
