@@ -178,6 +178,39 @@ export default function CalendarPage() {
     return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
   };
 
+  type Segment = { type: "work" | "pause"; from: string; to: string };
+
+  const getSegments = (s: Session): Segment[] => {
+    if (!s.ended_at) return [];
+    const pauses = [...(s.session_pauses || [])]
+      .filter((p) => p.paused_at)
+      .sort((a, b) => new Date(a.paused_at).getTime() - new Date(b.paused_at).getTime());
+
+    const segments: Segment[] = [];
+    let cursor = s.started_at;
+    const end = s.ended_at;
+
+    for (const p of pauses) {
+      const pStart = p.paused_at;
+      const pEnd = p.resumed_at || end;
+      if (new Date(pStart).getTime() > new Date(cursor).getTime()) {
+        segments.push({ type: "work", from: cursor, to: pStart });
+      }
+      if (new Date(pEnd).getTime() > new Date(pStart).getTime()) {
+        segments.push({ type: "pause", from: pStart, to: pEnd });
+      }
+      cursor = pEnd;
+    }
+    if (new Date(end).getTime() > new Date(cursor).getTime()) {
+      segments.push({ type: "work", from: cursor, to: end });
+    }
+    // No pauses → single work block
+    if (segments.length === 0) {
+      segments.push({ type: "work", from: s.started_at, to: end });
+    }
+    return segments;
+  };
+
   const getActivities = (s: Session) => {
     if (!s.session_activities?.length) return s.custom_note || "—";
     const names = s.session_activities
@@ -582,11 +615,33 @@ export default function CalendarPage() {
                   )}
                 </div>
               </div>
-              <p className="text-white/40 text-xs">
-                {formatDate(s.started_at)} · {formatTime(s.started_at)}
-                {s.ended_at && ` — ${formatTime(s.ended_at)}`}
+              <p className="text-white/30 text-[10px] mt-0.5">{formatDate(s.started_at)}</p>
+
+              {/* Work / Pause breakdown */}
+              <div className="mt-2 space-y-1">
+                {getSegments(s).map((seg, i) => (
+                  <div key={i} className="flex items-center gap-2 text-xs">
+                    <span
+                      className="w-1.5 h-1.5 rounded-full shrink-0"
+                      style={{ background: seg.type === "work" ? "#4ade80" : "#fbbf24" }}
+                    />
+                    <span className="text-white/50">
+                      {formatTime(seg.from)} – {formatTime(seg.to)}
+                    </span>
+                    <span style={{ color: seg.type === "work" ? "#86efac" : "#fbbf24" }}>
+                      {seg.type === "work" ? "worked" : "pause"}
+                    </span>
+                  </div>
+                ))}
+              </div>
+
+              <p className="text-white/60 text-xs mt-2 leading-relaxed">
+                <span className="text-white/30">Activity: </span>
+                {getActivities(s)}
               </p>
-              <p className="text-white/60 text-xs mt-1.5 leading-relaxed">{getActivities(s)}</p>
+              <p className="text-white/40 text-[10px] mt-1">
+                Paid hours: <span className="text-white/70">{calcHours(s)}</span>
+              </p>
 
               {isAdmin && (
                 <div className="flex gap-2 mt-2.5">

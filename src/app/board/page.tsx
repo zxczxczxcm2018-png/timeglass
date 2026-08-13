@@ -23,6 +23,10 @@ type Session = {
     custom_text: string | null;
     activity_types?: { name: string } | null;
   }[];
+  session_pauses?: {
+    paused_at: string;
+    resumed_at: string | null;
+  }[];
 };
 
 type RunningInfo = {
@@ -198,6 +202,27 @@ export default function BoardPage() {
     return Math.max(0, ms) / 3600000;
   };
 
+  type Segment = { type: "work" | "pause"; from: string; to: string };
+  const getSegments = (s: Session): Segment[] => {
+    if (!s.ended_at) return [];
+    const pauses = [...(s.session_pauses || [])]
+      .filter((p) => p.paused_at)
+      .sort((a, b) => new Date(a.paused_at).getTime() - new Date(b.paused_at).getTime());
+    const segments: Segment[] = [];
+    let cursor = s.started_at;
+    const end = s.ended_at;
+    for (const p of pauses) {
+      const pStart = p.paused_at;
+      const pEnd = p.resumed_at || end;
+      if (new Date(pStart) > new Date(cursor)) segments.push({ type: "work", from: cursor, to: pStart });
+      if (new Date(pEnd) > new Date(pStart)) segments.push({ type: "pause", from: pStart, to: pEnd });
+      cursor = pEnd;
+    }
+    if (new Date(end) > new Date(cursor)) segments.push({ type: "work", from: cursor, to: end });
+    if (segments.length === 0) segments.push({ type: "work", from: s.started_at, to: end });
+    return segments;
+  };
+
   const getActivities = (s: Session) => {
     if (!s.session_activities?.length) return s.custom_note || "—";
     const names = s.session_activities
@@ -361,8 +386,18 @@ export default function BoardPage() {
                   <tr key={s.id} className="border-b border-white/5 hover:bg-white/[0.02]">
                     <td className="px-4 py-2.5 font-medium whitespace-nowrap">{s.employees?.name || "—"}</td>
                     <td className="px-4 py-2.5 text-white/50 whitespace-nowrap">{formatDate(s.started_at)}</td>
-                    <td className="px-4 py-2.5 text-white/50 whitespace-nowrap">
-                      {formatTime(s.started_at)}{s.ended_at && ` – ${formatTime(s.ended_at)}`}
+                    <td className="px-4 py-2.5 text-white/50">
+                      <div className="space-y-0.5">
+                        {getSegments(s).map((seg, i) => (
+                          <div key={i} className="whitespace-nowrap text-xs">
+                            <span className="text-white/60">{formatTime(seg.from)} – {formatTime(seg.to)}</span>
+                            {" "}
+                            <span style={{ color: seg.type === "work" ? "#4ade80" : "#fbbf24" }}>
+                              {seg.type === "work" ? "worked" : "pause"}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
                     </td>
                     <td className="px-4 py-2.5 whitespace-nowrap">{getHours(s).toFixed(2)}h</td>
                     <td className="px-4 py-2.5 text-white/60 max-w-[220px] truncate">{getActivities(s)}</td>
