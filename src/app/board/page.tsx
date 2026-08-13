@@ -103,7 +103,8 @@ export default function BoardPage() {
       .select(`
         id, employee_id, started_at, ended_at, status, custom_note, is_paid, is_disputed,
         employees ( name ),
-        session_activities ( custom_text, activity_types ( name ) )
+        session_activities ( custom_text, activity_types ( name ) ),
+        session_pauses ( paused_at, resumed_at )
       `)
       .eq("status", "completed")
       .gte("started_at", from.toISOString())
@@ -179,9 +180,15 @@ export default function BoardPage() {
   const formatTime = (iso: string) =>
     new Date(iso).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
 
-  const getHours = (start: string, end: string | null) => {
-    if (!end) return 0;
-    return (new Date(end).getTime() - new Date(start).getTime()) / 3600000;
+  const getHours = (s: { started_at: string; ended_at: string | null; session_pauses?: { paused_at: string; resumed_at: string | null }[] }) => {
+    if (!s.ended_at) return 0;
+    let ms = new Date(s.ended_at).getTime() - new Date(s.started_at).getTime();
+    for (const p of s.session_pauses || []) {
+      if (!p.paused_at) continue;
+      const pEnd = p.resumed_at ? new Date(p.resumed_at).getTime() : new Date(s.ended_at).getTime();
+      ms -= Math.max(0, pEnd - new Date(p.paused_at).getTime());
+    }
+    return Math.max(0, ms) / 3600000;
   };
 
   const getActivities = (s: Session) => {
@@ -194,12 +201,12 @@ export default function BoardPage() {
 
   const sorted = [...sessions].sort((a, b) => {
     if (sortBy === "name") return (a.employees?.name || "").localeCompare(b.employees?.name || "");
-    if (sortBy === "hours") return getHours(b.started_at, b.ended_at) - getHours(a.started_at, a.ended_at);
+    if (sortBy === "hours") return getHours(b) - getHours(a);
     return new Date(b.started_at).getTime() - new Date(a.started_at).getTime();
   });
 
-  const totalHours = sessions.reduce((s, x) => s + getHours(x.started_at, x.ended_at), 0);
-  const paidHours = sessions.filter((x) => x.is_paid).reduce((s, x) => s + getHours(x.started_at, x.ended_at), 0);
+  const totalHours = sessions.reduce((s, x) => s + getHours(x), 0);
+  const paidHours = sessions.filter((x) => x.is_paid).reduce((s, x) => s + getHours(x), 0);
 
   // LOGIN SCREEN
   if (!user) {
@@ -350,7 +357,7 @@ export default function BoardPage() {
                     <td className="px-4 py-2.5 text-white/50 whitespace-nowrap">
                       {formatTime(s.started_at)}{s.ended_at && ` – ${formatTime(s.ended_at)}`}
                     </td>
-                    <td className="px-4 py-2.5 whitespace-nowrap">{getHours(s.started_at, s.ended_at).toFixed(2)}h</td>
+                    <td className="px-4 py-2.5 whitespace-nowrap">{getHours(s).toFixed(2)}h</td>
                     <td className="px-4 py-2.5 text-white/60 max-w-[220px] truncate">{getActivities(s)}</td>
                     <td className="px-4 py-2.5 whitespace-nowrap">
                       <div className="flex gap-1.5">
