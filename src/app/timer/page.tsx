@@ -12,6 +12,7 @@ type User = {
 };
 
 type ActivityType = { id: string; name: string };
+type AmPmTime = { hour: number; minute: number; ampm: "AM" | "PM" };
 
 const CATEGORIES = [
   { id: "ticket-review", name: "Ticket Review", children: ["Ticket Review — New", "Ticket Review — Approved", "Ticket Review — Finished"] },
@@ -113,8 +114,8 @@ export default function TimerPage() {
   const [showTimeModal, setShowTimeModal] = useState(false);
   const [sessionStart, setSessionStart] = useState<Date | null>(null);
   const [sessionEnd, setSessionEnd] = useState<Date | null>(null);
-  const [adjustStart, setAdjustStart] = useState("");
-  const [adjustEnd, setAdjustEnd] = useState("");
+  const [adjustStart, setAdjustStart] = useState<AmPmTime>({ hour: 9, minute: 0, ampm: "AM" });
+  const [adjustEnd, setAdjustEnd] = useState<AmPmTime>({ hour: 5, minute: 0, ampm: "PM" });
 
   // Interrupted session recovery
   const [recoverySession, setRecoverySession] = useState<{
@@ -373,15 +374,25 @@ export default function TimerPage() {
     const s = total % 60;
     return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
   };
-  // Always HH:MM 24h — required for <input type="time">
-  const formatDateTime = (d: Date) => {
-    const h = String(d.getHours()).padStart(2, "0");
-    const m = String(d.getMinutes()).padStart(2, "0");
-    return `${h}:${m}`;
+  const dateToAmPm = (d: Date): AmPmTime => {
+    let h = d.getHours();
+    const m = d.getMinutes();
+    const ampm: "AM" | "PM" = h >= 12 ? "PM" : "AM";
+    h = h % 12;
+    if (h === 0) h = 12;
+    return { hour: h, minute: m, ampm };
   };
 
-  const formatDisplayTime = (iso: string) =>
-    new Date(iso).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+  const amPmToDate = (base: Date, t: AmPmTime): Date => {
+    const result = new Date(base);
+    let h = t.hour % 12;
+    if (t.ampm === "PM") h += 12;
+    result.setHours(h, t.minute, 0, 0);
+    return result;
+  };
+
+  const formatAmPmLabel = (t: AmPmTime) =>
+    `${t.hour}:${String(t.minute).padStart(2, "0")} ${t.ampm}`;
 
   const handleStart = async () => {
     if (!user) return;
@@ -510,8 +521,8 @@ export default function TimerPage() {
       const end = new Date();
       setSessionStart(start);
       setSessionEnd(end);
-      setAdjustStart(formatDateTime(start));
-      setAdjustEnd(formatDateTime(end));
+      setAdjustStart(dateToAmPm(start));
+      setAdjustEnd(dateToAmPm(end));
     }
     setShowActivityModal(false);
     setShowTimeModal(true);
@@ -519,12 +530,8 @@ export default function TimerPage() {
 
   const handleFinalSave = async () => {
     if (!sessionId || !sessionStart || !sessionEnd || !user) return;
-    const [sh, sm] = adjustStart.split(":").map(Number);
-    const [eh, em] = adjustEnd.split(":").map(Number);
-    const newStart = new Date(sessionStart);
-    newStart.setHours(sh, sm, 0, 0);
-    const newEnd = new Date(sessionEnd);
-    newEnd.setHours(eh, em, 0, 0);
+    const newStart = amPmToDate(sessionStart, adjustStart);
+    const newEnd = amPmToDate(sessionEnd, adjustEnd);
 
     const TOL = 5 * 60 * 1000;
     if (newStart < new Date(sessionStart.getTime() - TOL) ||
@@ -629,8 +636,8 @@ export default function TimerPage() {
     setSessionId(recoverySession.id);
     setSessionStart(new Date(recoverySession.started_at));
     setSessionEnd(new Date(recoverySession.ended_at));
-    setAdjustStart(formatDateTime(new Date(recoverySession.started_at)));
-    setAdjustEnd(formatDateTime(new Date(recoverySession.ended_at)));
+    setAdjustStart(dateToAmPm(new Date(recoverySession.started_at)));
+    setAdjustEnd(dateToAmPm(new Date(recoverySession.ended_at)));
     setShowRecovery(false);
     setShowActivityModal(true);
   };
@@ -872,7 +879,7 @@ export default function TimerPage() {
         </div>
       )}
 
-      {/* Time adjust modal */}
+      {/* Time adjust modal — always AM/PM */}
       {showTimeModal && sessionStart && sessionEnd && (
         <div className="absolute inset-0 z-50 flex items-end justify-center bg-black/70" style={{ backdropFilter: "blur(8px)" }}>
           <div className="w-full max-w-md rounded-t-3xl p-6"
@@ -880,21 +887,79 @@ export default function TimerPage() {
             <div className="text-center mb-5">
               <h2 className="text-lg font-medium">Adjust work time</h2>
               <p className="text-white/40 text-sm mt-1">
-                {formatDateTime(sessionStart)} — {formatDateTime(sessionEnd)} (±5 min)
+                {formatAmPmLabel(dateToAmPm(sessionStart))} — {formatAmPmLabel(dateToAmPm(sessionEnd))} (±5 min)
               </p>
             </div>
             <div className="space-y-4">
               <div>
                 <label className="text-white/50 text-xs uppercase">From</label>
-                <input type="time" value={adjustStart} onChange={(e) => setAdjustStart(e.target.value)}
-                  className="w-full mt-1.5 px-4 py-3.5 rounded-xl outline-none text-lg"
-                  style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)" }} />
+                <div className="flex gap-2 mt-1.5">
+                  <select
+                    value={adjustStart.hour}
+                    onChange={(e) => setAdjustStart({ ...adjustStart, hour: Number(e.target.value) })}
+                    className="flex-1 px-3 py-3 rounded-xl text-center text-lg outline-none"
+                    style={{ background: "#1a1a24", color: "#fff", border: "1px solid rgba(255,255,255,0.15)" }}
+                  >
+                    {Array.from({ length: 12 }, (_, i) => i + 1).map((h) => (
+                      <option key={h} value={h} style={{ background: "#1a1a24" }}>{h}</option>
+                    ))}
+                  </select>
+                  <span className="flex items-center text-white/40 text-lg">:</span>
+                  <select
+                    value={adjustStart.minute}
+                    onChange={(e) => setAdjustStart({ ...adjustStart, minute: Number(e.target.value) })}
+                    className="flex-1 px-3 py-3 rounded-xl text-center text-lg outline-none"
+                    style={{ background: "#1a1a24", color: "#fff", border: "1px solid rgba(255,255,255,0.15)" }}
+                  >
+                    {Array.from({ length: 60 }, (_, i) => i).map((m) => (
+                      <option key={m} value={m} style={{ background: "#1a1a24" }}>{String(m).padStart(2, "0")}</option>
+                    ))}
+                  </select>
+                  <select
+                    value={adjustStart.ampm}
+                    onChange={(e) => setAdjustStart({ ...adjustStart, ampm: e.target.value as "AM" | "PM" })}
+                    className="px-3 py-3 rounded-xl text-center text-lg outline-none"
+                    style={{ background: "#1a1a24", color: "#fff", border: "1px solid rgba(255,255,255,0.15)" }}
+                  >
+                    <option value="AM" style={{ background: "#1a1a24" }}>AM</option>
+                    <option value="PM" style={{ background: "#1a1a24" }}>PM</option>
+                  </select>
+                </div>
               </div>
               <div>
                 <label className="text-white/50 text-xs uppercase">To</label>
-                <input type="time" value={adjustEnd} onChange={(e) => setAdjustEnd(e.target.value)}
-                  className="w-full mt-1.5 px-4 py-3.5 rounded-xl outline-none text-lg"
-                  style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)" }} />
+                <div className="flex gap-2 mt-1.5">
+                  <select
+                    value={adjustEnd.hour}
+                    onChange={(e) => setAdjustEnd({ ...adjustEnd, hour: Number(e.target.value) })}
+                    className="flex-1 px-3 py-3 rounded-xl text-center text-lg outline-none"
+                    style={{ background: "#1a1a24", color: "#fff", border: "1px solid rgba(255,255,255,0.15)" }}
+                  >
+                    {Array.from({ length: 12 }, (_, i) => i + 1).map((h) => (
+                      <option key={h} value={h} style={{ background: "#1a1a24" }}>{h}</option>
+                    ))}
+                  </select>
+                  <span className="flex items-center text-white/40 text-lg">:</span>
+                  <select
+                    value={adjustEnd.minute}
+                    onChange={(e) => setAdjustEnd({ ...adjustEnd, minute: Number(e.target.value) })}
+                    className="flex-1 px-3 py-3 rounded-xl text-center text-lg outline-none"
+                    style={{ background: "#1a1a24", color: "#fff", border: "1px solid rgba(255,255,255,0.15)" }}
+                  >
+                    {Array.from({ length: 60 }, (_, i) => i).map((m) => (
+                      <option key={m} value={m} style={{ background: "#1a1a24" }}>{String(m).padStart(2, "0")}</option>
+                    ))}
+                  </select>
+                  <select
+                    value={adjustEnd.ampm}
+                    onChange={(e) => setAdjustEnd({ ...adjustEnd, ampm: e.target.value as "AM" | "PM" })}
+                    className="px-3 py-3 rounded-xl text-center text-lg outline-none"
+                    style={{ background: "#1a1a24", color: "#fff", border: "1px solid rgba(255,255,255,0.15)" }}
+                  >
+                    <option value="AM" style={{ background: "#1a1a24" }}>AM</option>
+                    <option value="PM" style={{ background: "#1a1a24" }}>PM</option>
+                  </select>
+                </div>
               </div>
             </div>
             <div className="flex gap-3 pt-5">
