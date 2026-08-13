@@ -31,6 +31,10 @@ type Session = {
     custom_text: string | null;
     activity_types?: { name: string } | null;
   }[];
+  session_pauses?: {
+    paused_at: string;
+    resumed_at: string | null;
+  }[];
 };
 
 type ActivityType = {
@@ -95,7 +99,8 @@ export default function CalendarPage() {
       .select(`
         id, employee_id, started_at, ended_at, status, custom_note, is_paid, is_disputed,
         employees ( name ),
-        session_activities ( id, custom_text, activity_types ( name ) )
+        session_activities ( id, custom_text, activity_types ( name ) ),
+        session_pauses ( paused_at, resumed_at )
       `)
       .eq("status", "completed")
       .gte("started_at", from.toISOString())
@@ -135,10 +140,22 @@ export default function CalendarPage() {
     return { from, to };
   };
 
-  const calcHours = (start: string, end: string | null) => {
-    if (!end) return "—";
-    const h = (new Date(end).getTime() - new Date(start).getTime()) / 3600000;
-    return h.toFixed(2) + "h";
+  const calcHoursNum = (s: Session) => {
+    if (!s.ended_at) return 0;
+    let ms = new Date(s.ended_at).getTime() - new Date(s.started_at).getTime();
+    for (const p of s.session_pauses || []) {
+      if (!p.paused_at) continue;
+      const pEnd = p.resumed_at
+        ? new Date(p.resumed_at).getTime()
+        : new Date(s.ended_at).getTime();
+      ms -= Math.max(0, pEnd - new Date(p.paused_at).getTime());
+    }
+    return Math.max(0, ms) / 3600000;
+  };
+
+  const calcHours = (s: Session) => {
+    if (!s.ended_at) return "—";
+    return calcHoursNum(s).toFixed(2) + "h";
   };
 
   const formatDate = (iso: string) =>
@@ -155,12 +172,12 @@ export default function CalendarPage() {
     return [...new Set(names)].join(", ");
   };
 
-  // Summary
+  // Summary (minus pauses)
   const summary: Record<string, { name: string; hours: number; paidHours: number; count: number }> = {};
   sessions.forEach((s) => {
     if (!s.ended_at) return;
     const name = s.employees?.name || "Unknown";
-    const h = (new Date(s.ended_at).getTime() - new Date(s.started_at).getTime()) / 3600000;
+    const h = calcHoursNum(s);
     if (!summary[s.employee_id]) summary[s.employee_id] = { name, hours: 0, paidHours: 0, count: 0 };
     summary[s.employee_id].hours += h;
     summary[s.employee_id].count += 1;
@@ -225,28 +242,33 @@ export default function CalendarPage() {
     if (!formEmployee || !formDate || !formStart || !formEnd) return;
     setSaving(true);
 
-    const startISO = new Date(`${formDate}T${formStart}:00`).toISOString();
-    const endISO = new Date(`${formDate}T${formEnd}:00`).toISOString();
-    const newStart = new Date(startISO).getTime();
-    const newEnd = new Date(endISO).getTime();
+    // Parse times in local timezone
+    const startLocal = new Date(`${formDate}T${formStart}:00`);
+    const endLocal = new Date(`${formDate}T${formEnd}:00`);
 
-    if (newStart >= newEnd) {
+    if (startLocal.getTime() >= endLocal.getTime()) {
       alert("End time must be after start time");
       setSaving(false);
       return;
     }
 
-    // Overlap check
-    const dayStart = `${formDate}T00:00:00.000Z`;
-    const dayEnd = `${formDate}T23:59:59.999Z`;
+    let finalStart = startLocal;
+    let finalEnd = endLocal;
+    const mergeIds: string[] = [];
+
+    // Find overlapping sessions on same day for this employee
+    const dayStart = new Date(formDate);
+    dayStart.setHours(0, 0, 0, 0);
+    const dayEnd = new Date(formDate);
+    dayEnd.setHours(23, 59, 59, 999);
 
     let query = supabase
       .from("work_sessions")
       .select("id, started_at, ended_at")
       .eq("employee_id", formEmployee)
       .eq("status", "completed")
-      .gte("started_at", dayStart)
-      .lte("started_at", dayEnd);
+      .gte("started_at", dayStart.toISOString())
+      .lte("started_at", dayEnd.toISOString());
 
     if (editingSession) {
       query = query.neq("id", editingSession.id);
@@ -258,13 +280,18 @@ export default function CalendarPage() {
         if (!s.ended_at) continue;
         const sStart = new Date(s.started_at).getTime();
         const sEnd = new Date(s.ended_at).getTime();
-        if (newStart < sEnd && newEnd > sStart) {
-          alert("This time overlaps with another session. One hour can only be registered once.");
-          setSaving(false);
-          return;
+        if (finalStart.getTime() < sEnd && finalEnd.getTime() > sStart) {
+          mergeIds.push(s.id);
+          if (sStart < finalStart.getTime()) finalStart = new Date(s.started_at);
+          if (sEnd > finalEnd.getTime()) finalEnd = new Date(s.ended_at);
         }
       }
     }
+
+    const startISO = finalStart.toISOString();
+    const endISO = finalEnd.toISOString();
+
+    let targetId = editingSession?.id || null;
 
     if (editingSession) {
       await supabase
@@ -276,15 +303,7 @@ export default function CalendarPage() {
           custom_note: formNote || null,
         })
         .eq("id", editingSession.id);
-
-      // Update activity if selected
-      if (formActivity) {
-        await supabase.from("session_activities").delete().eq("session_id", editingSession.id);
-        await supabase.from("session_activities").insert({
-          session_id: editingSession.id,
-          activity_type_id: formActivity,
-        });
-      }
+      targetId = editingSession.id;
     } else {
       const { data: newSess } = await supabase
         .from("work_sessions")
@@ -298,13 +317,67 @@ export default function CalendarPage() {
         })
         .select()
         .single();
+      targetId = newSess?.id || null;
+    }
 
-      if (newSess && formActivity) {
-        await supabase.from("session_activities").insert({
-          session_id: newSess.id,
-          activity_type_id: formActivity,
-        });
+    if (!targetId) {
+      setSaving(false);
+      return;
+    }
+
+    // Collect unique activities from merged sessions + new activity
+    const activityIds = new Set<string>();
+    const customTexts = new Set<string>();
+
+    if (formActivity) activityIds.add(formActivity);
+
+    for (const mid of mergeIds) {
+      const { data: oldActs } = await supabase
+        .from("session_activities")
+        .select("activity_type_id, custom_text")
+        .eq("session_id", mid);
+      if (oldActs) {
+        for (const a of oldActs) {
+          if (a.activity_type_id) activityIds.add(a.activity_type_id);
+          if (a.custom_text) customTexts.add(a.custom_text);
+        }
       }
+    }
+
+    // Also keep existing activities on the target session if editing
+    if (editingSession) {
+      const { data: curActs } = await supabase
+        .from("session_activities")
+        .select("activity_type_id, custom_text")
+        .eq("session_id", targetId);
+      if (curActs) {
+        for (const a of curActs) {
+          if (a.activity_type_id) activityIds.add(a.activity_type_id);
+          if (a.custom_text) customTexts.add(a.custom_text);
+        }
+      }
+    }
+
+    // Rebuild activities on target (unique)
+    await supabase.from("session_activities").delete().eq("session_id", targetId);
+    for (const aid of activityIds) {
+      await supabase.from("session_activities").insert({
+        session_id: targetId,
+        activity_type_id: aid,
+      });
+    }
+    for (const txt of customTexts) {
+      await supabase.from("session_activities").insert({
+        session_id: targetId,
+        custom_text: txt,
+      });
+    }
+
+    // Delete merged sessions
+    for (const mid of mergeIds) {
+      await supabase.from("session_activities").delete().eq("session_id", mid);
+      await supabase.from("session_pauses").delete().eq("session_id", mid);
+      await supabase.from("work_sessions").delete().eq("id", mid);
     }
 
     setSaving(false);
@@ -450,7 +523,7 @@ export default function CalendarPage() {
               <div className="flex justify-between items-start mb-1">
                 <p className="font-medium text-sm">{s.employees?.name || "Unknown"}</p>
                 <div className="flex items-center gap-2">
-                  <p className="text-white/50 text-xs">{calcHours(s.started_at, s.ended_at)}</p>
+                  <p className="text-white/50 text-xs">{calcHours(s)}</p>
                   {/* Paid toggle */}
                   {canTogglePaid(s) ? (
                     <button
