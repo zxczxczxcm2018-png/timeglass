@@ -238,15 +238,25 @@ export default function TimerPage() {
 
       const { data: sessions } = await supabase
         .from("work_sessions")
-        .select("started_at, ended_at")
+        .select("id, started_at, ended_at, session_pauses ( paused_at, resumed_at )")
         .eq("employee_id", user.id)
         .eq("status", "completed")
         .gte("started_at", startOfMonth.toISOString());
 
+      const workedHours = (s: any) => {
+        if (!s.ended_at) return 0;
+        let ms = new Date(s.ended_at).getTime() - new Date(s.started_at).getTime();
+        for (const p of s.session_pauses || []) {
+          if (!p.paused_at) continue;
+          const pEnd = p.resumed_at ? new Date(p.resumed_at).getTime() : new Date(s.ended_at).getTime();
+          ms -= Math.max(0, pEnd - new Date(p.paused_at).getTime());
+        }
+        return Math.max(0, ms) / 3600000;
+      };
+
       let t = 0, w = 0, m = 0;
-      (sessions || []).forEach((s) => {
-        if (!s.ended_at) return;
-        const h = (new Date(s.ended_at).getTime() - new Date(s.started_at).getTime()) / 3600000;
+      (sessions || []).forEach((s: any) => {
+        const h = workedHours(s);
         m += h;
         if (new Date(s.started_at) >= startOfWeek) w += h;
         if (new Date(s.started_at) >= startOfDay) t += h;
@@ -532,6 +542,20 @@ export default function TimerPage() {
     if (!sessionId || !sessionStart || !sessionEnd || !user) return;
     const newStart = amPmToDate(sessionStart, adjustStart);
     const newEnd = amPmToDate(sessionEnd, adjustEnd);
+
+    // Close any open pause at session end so pause time is counted correctly
+    const { data: openPauses } = await supabase
+      .from("session_pauses")
+      .select("id")
+      .eq("session_id", sessionId)
+      .is("resumed_at", null);
+    if (openPauses) {
+      for (const p of openPauses) {
+        await supabase.from("session_pauses").update({
+          resumed_at: newEnd.toISOString(),
+        }).eq("id", p.id);
+      }
+    }
 
     const TOL = 5 * 60 * 1000;
     if (newStart < new Date(sessionStart.getTime() - TOL) ||
