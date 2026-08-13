@@ -159,23 +159,23 @@ export default function TimerPage() {
     }
   }, [router]);
 
-  // Check for interrupted sessions after login
+  // Check for interrupted sessions — only once per login
+  const recoveryChecked = useRef(false);
   useEffect(() => {
-    if (!user) return;
-    // Don't show recovery if timer is currently running from localStorage
+    if (!user || recoveryChecked.current) return;
     if (timerRef.current) return;
+    recoveryChecked.current = true;
 
     (async () => {
-      // 1. Running sessions left behind (PC crashed / closed without stop)
+      // 1. Running sessions left behind
       const { data: running } = await supabase
         .from("work_sessions")
-        .select("id, started_at")
+        .select("id, started_at, custom_note")
         .eq("employee_id", user.id)
         .eq("status", "running")
         .order("started_at", { ascending: false });
 
       if (running && running.length > 0) {
-        // Complete them and offer recovery for the latest
         const latest = running[0];
         const endTime = new Date().toISOString();
         for (const s of running) {
@@ -184,13 +184,12 @@ export default function TimerPage() {
             ended_at: endTime,
           }).eq("id", s.id);
         }
-        // Check if latest has no activities
         const { data: acts } = await supabase
           .from("session_activities")
           .select("id")
           .eq("session_id", latest.id)
           .limit(1);
-        if (!acts || acts.length === 0) {
+        if ((!acts || acts.length === 0) && latest.custom_note !== "__skipped__") {
           setRecoverySession({
             id: latest.id,
             started_at: latest.started_at,
@@ -201,19 +200,20 @@ export default function TimerPage() {
         return;
       }
 
-      // 2. Recently completed sessions without any activity (auto-completed offline)
+      // 2. Completed without activity, not skipped
       const since = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
       const { data: completed } = await supabase
         .from("work_sessions")
-        .select("id, started_at, ended_at")
+        .select("id, started_at, ended_at, custom_note")
         .eq("employee_id", user.id)
         .eq("status", "completed")
         .gte("ended_at", since)
         .order("ended_at", { ascending: false })
-        .limit(5);
+        .limit(10);
 
       if (completed) {
         for (const s of completed) {
+          if (s.custom_note === "__skipped__") continue;
           const { data: acts } = await supabase
             .from("session_activities")
             .select("id")
@@ -398,8 +398,15 @@ export default function TimerPage() {
     const s = total % 60;
     return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
   };
-  const formatDateTime = (d: Date) =>
-    d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+  // Always HH:MM 24h — required for <input type="time">
+  const formatDateTime = (d: Date) => {
+    const h = String(d.getHours()).padStart(2, "0");
+    const m = String(d.getMinutes()).padStart(2, "0");
+    return `${h}:${m}`;
+  };
+
+  const formatDisplayTime = (iso: string) =>
+    new Date(iso).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
 
   const handleStart = async () => {
     if (!user) return;
@@ -653,7 +660,14 @@ export default function TimerPage() {
     setShowActivityModal(true);
   };
 
-  const handleRecoverySkip = () => {
+  const handleRecoverySkip = async () => {
+    if (recoverySession) {
+      // Mark so it never shows again
+      await supabase
+        .from("work_sessions")
+        .update({ custom_note: "__skipped__" })
+        .eq("id", recoverySession.id);
+    }
     setShowRecovery(false);
     setRecoverySession(null);
   };
