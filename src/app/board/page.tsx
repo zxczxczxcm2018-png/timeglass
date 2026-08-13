@@ -64,6 +64,8 @@ export default function BoardPage() {
   const [loading, setLoading] = useState(true);
   const [lastUpdate, setLastUpdate] = useState<Date>(new Date());
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [filterEmployee, setFilterEmployee] = useState("all");
+  const [filterPaid, setFilterPaid] = useState<"all" | "paid" | "unpaid">("all");
 
   const now = new Date();
   const [fromDate, setFromDate] = useState(
@@ -323,7 +325,29 @@ export default function BoardPage() {
     );
   };
 
-  const dayGroups = buildDayGroups();
+  const allDayGroups = buildDayGroups();
+
+  // Unique employees for filter dropdown
+  const employeeOptions = (() => {
+    const map = new Map<string, string>();
+    for (const d of allDayGroups) {
+      for (const e of d.employees) map.set(e.employeeId, e.name);
+    }
+    return [...map.entries()].sort((a, b) => a[1].localeCompare(b[1]));
+  })();
+
+  const dayGroups = allDayGroups
+    .map((day) => ({
+      ...day,
+      employees: day.employees.filter((e) => {
+        if (filterEmployee !== "all" && e.employeeId !== filterEmployee) return false;
+        if (filterPaid === "paid" && !e.allPaid) return false;
+        if (filterPaid === "unpaid" && e.allPaid) return false;
+        return true;
+      }),
+    }))
+    .filter((day) => day.employees.length > 0);
+
   const grandTotal = dayGroups.reduce(
     (sum, d) => sum + d.employees.reduce((s, e) => s + e.totalHours, 0),
     0
@@ -401,6 +425,27 @@ export default function BoardPage() {
             onChange={(e) => setToDate(e.target.value)}
             className="px-3 py-2 rounded-lg text-sm bg-[#111] border border-white/10 text-white outline-none"
           />
+          <select
+            value={filterEmployee}
+            onChange={(e) => setFilterEmployee(e.target.value)}
+            className="px-3 py-2 rounded-lg text-sm outline-none"
+            style={{ background: "#111", color: "#fff", border: "1px solid rgba(255,255,255,0.1)" }}
+          >
+            <option value="all" style={{ background: "#111" }}>All employees</option>
+            {employeeOptions.map(([id, name]) => (
+              <option key={id} value={id} style={{ background: "#111" }}>{name}</option>
+            ))}
+          </select>
+          <select
+            value={filterPaid}
+            onChange={(e) => setFilterPaid(e.target.value as "all" | "paid" | "unpaid")}
+            className="px-3 py-2 rounded-lg text-sm outline-none"
+            style={{ background: "#111", color: "#fff", border: "1px solid rgba(255,255,255,0.1)" }}
+          >
+            <option value="all" style={{ background: "#111" }}>All status</option>
+            <option value="paid" style={{ background: "#111" }}>Paid</option>
+            <option value="unpaid" style={{ background: "#111" }}>Unpaid</option>
+          </select>
           <div className="px-3 py-2 rounded-lg text-sm bg-[#111] border border-white/10 text-white/60">
             Total: <span className="text-white font-medium">{grandTotal.toFixed(2)}h</span>
           </div>
