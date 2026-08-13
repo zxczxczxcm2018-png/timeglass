@@ -161,8 +161,22 @@ export default function CalendarPage() {
   const formatDate = (iso: string) =>
     new Date(iso).toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" });
 
-  const formatTime = (iso: string) =>
-    new Date(iso).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+  // Always AM/PM for display (all locales)
+  const formatTime = (iso: string) => {
+    const d = new Date(iso);
+    let h = d.getHours();
+    const m = String(d.getMinutes()).padStart(2, "0");
+    const ampm = h >= 12 ? "PM" : "AM";
+    h = h % 12;
+    if (h === 0) h = 12;
+    return `${h}:${m} ${ampm}`;
+  };
+
+  // 24h for native time inputs in edit form
+  const formatTime24 = (iso: string) => {
+    const d = new Date(iso);
+    return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  };
 
   const getActivities = (s: Session) => {
     if (!s.session_activities?.length) return s.custom_note || "—";
@@ -231,8 +245,8 @@ export default function CalendarPage() {
     setEditingSession(s);
     setFormEmployee(s.employee_id);
     setFormDate(s.started_at.slice(0, 10));
-    setFormStart(formatTime(s.started_at));
-    setFormEnd(s.ended_at ? formatTime(s.ended_at) : "18:00");
+    setFormStart(formatTime24(s.started_at));
+    setFormEnd(s.ended_at ? formatTime24(s.ended_at) : "18:00");
     setFormActivity("");
     setFormNote(s.custom_note || "");
     setShowModal(true);
