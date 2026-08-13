@@ -29,10 +29,26 @@ type Session = {
   }[];
 };
 
-type RunningInfo = {
-  employee_id: string;
+type WorkBlock = {
+  from: Date;
+  to: Date;
+  activities: string;
+  sessionId: string;
+  isPaid: boolean;
+  isDisputed: boolean;
+};
+
+type DayEmployee = {
+  employeeId: string;
   name: string;
-  started_at: string;
+  blocks: WorkBlock[];
+  totalHours: number;
+};
+
+type DayGroup = {
+  dayKey: string; // YYYY-MM-DD local
+  label: string;
+  employees: DayEmployee[];
 };
 
 export default function BoardPage() {
@@ -44,12 +60,7 @@ export default function BoardPage() {
   const [loginLoading, setLoginLoading] = useState(false);
 
   const [sessions, setSessions] = useState<Session[]>([]);
-  const [running, setRunning] = useState<RunningInfo[]>([]);
   const [loading, setLoading] = useState(true);
-  const [filterPaid, setFilterPaid] = useState<"all" | "paid" | "unpaid">("all");
-  const [filterEmployee, setFilterEmployee] = useState("all");
-  const [employees, setEmployees] = useState<{ id: string; name: string }[]>([]);
-  const [sortBy, setSortBy] = useState<"date" | "hours" | "name">("date");
   const [lastUpdate, setLastUpdate] = useState<Date>(new Date());
 
   const now = new Date();
@@ -58,7 +69,6 @@ export default function BoardPage() {
   );
   const [toDate, setToDate] = useState(now.toISOString().slice(0, 10));
 
-  // Check existing login
   useEffect(() => {
     const saved = localStorage.getItem("timeglass_board_user");
     if (saved) {
@@ -99,10 +109,14 @@ export default function BoardPage() {
 
     const from = new Date(fromDate);
     from.setHours(0, 0, 0, 0);
+    // Load a bit extra before range for overnight sessions
+    const loadFrom = new Date(from);
+    loadFrom.setDate(loadFrom.getDate() - 1);
+
     const to = new Date(toDate);
     to.setHours(23, 59, 59, 999);
 
-    let q = supabase
+    const { data } = await supabase
       .from("work_sessions")
       .select(`
         id, employee_id, started_at, ended_at, status, custom_note, is_paid, is_disputed,
@@ -111,65 +125,14 @@ export default function BoardPage() {
         session_pauses ( paused_at, resumed_at )
       `)
       .eq("status", "completed")
-      .gte("started_at", from.toISOString())
+      .gte("started_at", loadFrom.toISOString())
       .lte("started_at", to.toISOString())
-      .order("started_at", { ascending: false });
+      .order("started_at", { ascending: true });
 
-    if (filterEmployee !== "all") q = q.eq("employee_id", filterEmployee);
-    if (filterPaid === "paid") q = q.eq("is_paid", true);
-    if (filterPaid === "unpaid") q = q.eq("is_paid", false);
-
-    const { data } = await q;
     if (data) setSessions(data as any);
-
-    // Currently working: status=running, no open pause, unique by employee, started < 16h ago
-    const cutoff = new Date(Date.now() - 16 * 60 * 60 * 1000).toISOString();
-    const { data: runData } = await supabase
-      .from("work_sessions")
-      .select(`id, employee_id, started_at, employees ( name )`)
-      .eq("status", "running")
-      .gte("started_at", cutoff)
-      .order("started_at", { ascending: false });
-
-    if (runData && runData.length > 0) {
-      // Get open pauses
-      const ids = runData.map((r: any) => r.id);
-      const { data: pauses } = await supabase
-        .from("session_pauses")
-        .select("session_id")
-        .in("session_id", ids)
-        .is("resumed_at", null);
-
-      const pausedIds = new Set((pauses || []).map((p: any) => p.session_id));
-
-      // Unique by employee_id, skip paused
-      const seen = new Set<string>();
-      const active: RunningInfo[] = [];
-      for (const r of runData as any[]) {
-        if (pausedIds.has(r.id)) continue;
-        if (seen.has(r.employee_id)) continue;
-        seen.add(r.employee_id);
-        active.push({
-          employee_id: r.employee_id,
-          name: r.employees?.name || "Unknown",
-          started_at: r.started_at,
-        });
-      }
-      setRunning(active);
-    } else {
-      setRunning([]);
-    }
-
-    const { data: emps } = await supabase
-      .from("employees")
-      .select("id, name")
-      .eq("is_active", true)
-      .order("name");
-    if (emps) setEmployees(emps);
-
     setLastUpdate(new Date());
     setLoading(false);
-  }, [user, fromDate, toDate, filterPaid, filterEmployee]);
+  }, [user, fromDate, toDate]);
 
   useEffect(() => {
     if (!user) return;
@@ -178,11 +141,7 @@ export default function BoardPage() {
     return () => clearInterval(interval);
   }, [load, user]);
 
-  // Times in viewer's local timezone, ALWAYS AM/PM (forced for all locales)
-  const formatDate = (iso: string) =>
-    new Date(iso).toLocaleDateString(undefined, { day: "2-digit", month: "short", year: "numeric" });
-  const formatTime = (iso: string) => {
-    const d = new Date(iso);
+  const formatTime = (d: Date) => {
     let h = d.getHours();
     const m = String(d.getMinutes()).padStart(2, "0");
     const ampm = h >= 12 ? "PM" : "AM";
@@ -191,11 +150,43 @@ export default function BoardPage() {
     return `${h}:${m} ${ampm}`;
   };
 
-  type Segment = { type: "work" | "pause"; from: string; to: string };
-  const getSegments = (s: Session): Segment[] => {
+  const dayKeyLocal = (d: Date) => {
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, "0");
+    const day = String(d.getDate()).padStart(2, "0");
+    return `${y}-${m}-${day}`;
+  };
+
+  const dayLabel = (key: string) => {
+    const [y, m, d] = key.split("-").map(Number);
+    const date = new Date(y, m - 1, d);
+    return date.toLocaleDateString(undefined, {
+      weekday: "short",
+      day: "2-digit",
+      month: "short",
+      year: "numeric",
+    });
+  };
+
+  const getActivities = (s: Session) => {
+    if (s.custom_note && s.custom_note !== "__skipped__") {
+      // still prefer activities
+    }
+    if (!s.session_activities?.length) {
+      return s.custom_note && s.custom_note !== "__skipped__" ? s.custom_note : "—";
+    }
+    const names = s.session_activities
+      .map((a) => a.activity_types?.name || a.custom_text || "")
+      .filter(Boolean);
+    return [...new Set(names)].join(", ") || "—";
+  };
+
+  // Work-only segments (merge overlapping pauses)
+  const getWorkSegments = (s: Session): { from: Date; to: Date }[] => {
     if (!s.ended_at) return [];
     const endMs = new Date(s.ended_at).getTime();
     const startMs = new Date(s.started_at).getTime();
+
     const raw = [...(s.session_pauses || [])]
       .filter((p) => p.paused_at)
       .map((p) => ({
@@ -214,52 +205,118 @@ export default function BoardPage() {
       }
     }
 
-    const segments: Segment[] = [];
+    const work: { from: Date; to: Date }[] = [];
     let cursor = startMs;
     for (const p of merged) {
       if (p.start > cursor) {
-        segments.push({ type: "work", from: new Date(cursor).toISOString(), to: new Date(p.start).toISOString() });
+        work.push({ from: new Date(cursor), to: new Date(p.start) });
       }
-      segments.push({ type: "pause", from: new Date(p.start).toISOString(), to: new Date(p.end).toISOString() });
       cursor = Math.max(cursor, p.end);
     }
     if (endMs > cursor) {
-      segments.push({ type: "work", from: new Date(cursor).toISOString(), to: new Date(endMs).toISOString() });
+      work.push({ from: new Date(cursor), to: new Date(endMs) });
     }
-    if (segments.length === 0) {
-      segments.push({ type: "work", from: s.started_at, to: s.ended_at });
+    if (work.length === 0 && endMs > startMs) {
+      work.push({ from: new Date(startMs), to: new Date(endMs) });
     }
-    return segments;
+    return work;
   };
 
-  const getHours = (s: Session) => {
-    let ms = 0;
-    for (const seg of getSegments(s)) {
-      if (seg.type === "work") {
-        ms += Math.max(0, new Date(seg.to).getTime() - new Date(seg.from).getTime());
+  // Split a work segment at local midnight boundaries
+  const splitAtMidnight = (from: Date, to: Date): { from: Date; to: Date }[] => {
+    const parts: { from: Date; to: Date }[] = [];
+    let cur = new Date(from);
+    while (cur < to) {
+      const nextMidnight = new Date(cur);
+      nextMidnight.setHours(24, 0, 0, 0); // next local midnight
+      const end = to < nextMidnight ? to : new Date(nextMidnight.getTime() - 1); // 11:59:59.999
+      // Use exact next midnight as exclusive end for cleaner display
+      const segmentEnd = to <= nextMidnight ? to : nextMidnight;
+      // For display: if split, first part ends 11:59 PM, second starts 12:00 AM
+      if (to > nextMidnight) {
+        const endOfDay = new Date(cur);
+        endOfDay.setHours(23, 59, 59, 999);
+        parts.push({ from: new Date(cur), to: endOfDay });
+        cur = new Date(nextMidnight); // 00:00 next day
+      } else {
+        parts.push({ from: new Date(cur), to: new Date(to) });
+        break;
       }
     }
-    return ms / 3600000;
+    return parts;
   };
 
-  const getActivities = (s: Session) => {
-    if (!s.session_activities?.length) return s.custom_note || "—";
-    const names = s.session_activities
-      .map((a) => a.activity_types?.name || a.custom_text || "")
-      .filter(Boolean);
-    return [...new Set(names)].join(", ") || "—";
+  // Build day → employee → work blocks
+  const buildDayGroups = (): DayGroup[] => {
+    const rangeStart = new Date(fromDate);
+    rangeStart.setHours(0, 0, 0, 0);
+    const rangeEnd = new Date(toDate);
+    rangeEnd.setHours(23, 59, 59, 999);
+
+    // Map: dayKey → employeeId → DayEmployee
+    const map = new Map<string, Map<string, DayEmployee>>();
+
+    for (const s of sessions) {
+      if (!s.ended_at) continue;
+      const activities = getActivities(s);
+      const workSegs = getWorkSegments(s);
+
+      for (const w of workSegs) {
+        const parts = splitAtMidnight(w.from, w.to);
+        for (const part of parts) {
+          // Skip if outside selected range
+          if (part.to < rangeStart || part.from > rangeEnd) continue;
+
+          const key = dayKeyLocal(part.from);
+          if (!map.has(key)) map.set(key, new Map());
+          const empMap = map.get(key)!;
+
+          const empId = s.employee_id;
+          const empName = s.employees?.name || "Unknown";
+
+          if (!empMap.has(empId)) {
+            empMap.set(empId, {
+              employeeId: empId,
+              name: empName,
+              blocks: [],
+              totalHours: 0,
+            });
+          }
+          const emp = empMap.get(empId)!;
+          const hours = (part.to.getTime() - part.from.getTime()) / 3600000;
+          emp.blocks.push({
+            from: part.from,
+            to: part.to,
+            activities,
+            sessionId: s.id,
+            isPaid: s.is_paid,
+            isDisputed: s.is_disputed,
+          });
+          emp.totalHours += hours;
+        }
+      }
+    }
+
+    // Sort days descending, employees by name, blocks by time
+    const days = [...map.entries()].sort((a, b) => b[0].localeCompare(a[0]));
+    return days.map(([dayKey, empMap]) => ({
+      dayKey,
+      label: dayLabel(dayKey),
+      employees: [...empMap.values()]
+        .map((e) => ({
+          ...e,
+          blocks: e.blocks.sort((a, b) => a.from.getTime() - b.from.getTime()),
+        }))
+        .sort((a, b) => a.name.localeCompare(b.name)),
+    }));
   };
 
-  const sorted = [...sessions].sort((a, b) => {
-    if (sortBy === "name") return (a.employees?.name || "").localeCompare(b.employees?.name || "");
-    if (sortBy === "hours") return getHours(b) - getHours(a);
-    return new Date(b.started_at).getTime() - new Date(a.started_at).getTime();
-  });
+  const dayGroups = buildDayGroups();
+  const grandTotal = dayGroups.reduce(
+    (sum, d) => sum + d.employees.reduce((s, e) => s + e.totalHours, 0),
+    0
+  );
 
-  const totalHours = sessions.reduce((s, x) => s + getHours(x), 0);
-  const paidHours = sessions.filter((x) => x.is_paid).reduce((s, x) => s + getHours(x), 0);
-
-  // LOGIN SCREEN
   if (!user) {
     return (
       <div className="min-h-screen bg-black flex items-center justify-center p-6">
@@ -293,16 +350,15 @@ export default function BoardPage() {
     );
   }
 
-  // BOARD
   return (
     <div className="min-h-screen bg-black text-white p-4 md:p-8 font-sans">
-      <div className="max-w-6xl mx-auto">
+      <div className="max-w-4xl mx-auto">
         {/* Header */}
         <div className="flex flex-wrap items-center justify-between gap-3 mb-6">
           <div>
             <h1 className="text-xl font-bold">MANIAC</h1>
             <p className="text-white/30 text-xs tracking-[0.2em] uppercase">
-              Board · {user.name} · times in your local timezone
+              Board · {user.name} · local timezone · AM/PM
             </p>
           </div>
           <div className="flex items-center gap-4">
@@ -310,149 +366,111 @@ export default function BoardPage() {
               <p>Live · 30s</p>
               <p>{lastUpdate.toLocaleTimeString()}</p>
             </div>
-            <button onClick={handleLogout} className="text-xs px-3 py-1.5 rounded-lg text-white/40 border border-white/10">
+            <button
+              onClick={handleLogout}
+              className="text-xs px-3 py-1.5 rounded-lg text-white/40 border border-white/10"
+            >
               Logout
             </button>
           </div>
         </div>
 
-        {/* Currently working */}
-        {running.length > 0 && (
-          <div className="mb-5 p-4 rounded-xl border border-emerald-500/30 bg-emerald-500/5">
-            <p className="text-[10px] uppercase tracking-wider text-emerald-400/70 mb-2">Currently Working</p>
-            <div className="flex flex-wrap gap-2">
-              {running.map((r) => (
-                <div key={r.employee_id} className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-emerald-500/10 border border-emerald-500/20">
-                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-                  <span className="text-sm text-emerald-300">{r.name}</span>
-                  <span className="text-xs text-emerald-500/60">since {formatTime(r.started_at)}</span>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-
-        {/* Filters */}
+        {/* Date range */}
         <div className="flex flex-wrap gap-2 mb-4">
-          <input type="date" value={fromDate} onChange={(e) => setFromDate(e.target.value)}
-            className="px-3 py-2 rounded-lg text-sm bg-[#111] border border-white/10 text-white outline-none" />
-          <input type="date" value={toDate} onChange={(e) => setToDate(e.target.value)}
-            className="px-3 py-2 rounded-lg text-sm bg-[#111] border border-white/10 text-white outline-none" />
-          <select value={filterEmployee} onChange={(e) => setFilterEmployee(e.target.value)}
-            className="px-3 py-2 rounded-lg text-sm outline-none"
-            style={{ background: "#111", color: "#fff", border: "1px solid rgba(255,255,255,0.1)" }}>
-            <option value="all" style={{ background: "#111" }}>All employees</option>
-            {employees.map((e) => (
-              <option key={e.id} value={e.id} style={{ background: "#111" }}>{e.name}</option>
-            ))}
-          </select>
-          <select value={filterPaid} onChange={(e) => setFilterPaid(e.target.value as any)}
-            className="px-3 py-2 rounded-lg text-sm outline-none"
-            style={{ background: "#111", color: "#fff", border: "1px solid rgba(255,255,255,0.1)" }}>
-            <option value="all" style={{ background: "#111" }}>All status</option>
-            <option value="paid" style={{ background: "#111" }}>Paid</option>
-            <option value="unpaid" style={{ background: "#111" }}>Unpaid</option>
-          </select>
-          <select value={sortBy} onChange={(e) => setSortBy(e.target.value as any)}
-            className="px-3 py-2 rounded-lg text-sm outline-none"
-            style={{ background: "#111", color: "#fff", border: "1px solid rgba(255,255,255,0.1)" }}>
-            <option value="date" style={{ background: "#111" }}>Sort: Date</option>
-            <option value="hours" style={{ background: "#111" }}>Sort: Hours</option>
-            <option value="name" style={{ background: "#111" }}>Sort: Name</option>
-          </select>
-        </div>
-
-        {/* Summary */}
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mb-4">
-          <div className="p-3 rounded-xl bg-[#111] border border-white/5">
-            <p className="text-[10px] text-white/30 uppercase">Total</p>
-            <p className="text-lg font-medium">{totalHours.toFixed(1)}h</p>
-          </div>
-          <div className="p-3 rounded-xl bg-[#111] border border-emerald-500/20">
-            <p className="text-[10px] text-emerald-500/50 uppercase">Paid</p>
-            <p className="text-lg font-medium text-emerald-400">{paidHours.toFixed(1)}h</p>
-          </div>
-          <div className="p-3 rounded-xl bg-[#111] border border-white/5">
-            <p className="text-[10px] text-white/30 uppercase">Unpaid</p>
-            <p className="text-lg font-medium text-white/60">{(totalHours - paidHours).toFixed(1)}h</p>
-          </div>
-          <div className="p-3 rounded-xl bg-[#111] border border-amber-500/20">
-            <p className="text-[10px] text-amber-500/50 uppercase">Disputed</p>
-            <p className="text-lg font-medium text-amber-400">{sessions.filter(s => s.is_disputed).length}</p>
+          <input
+            type="date"
+            value={fromDate}
+            onChange={(e) => setFromDate(e.target.value)}
+            className="px-3 py-2 rounded-lg text-sm bg-[#111] border border-white/10 text-white outline-none"
+          />
+          <input
+            type="date"
+            value={toDate}
+            onChange={(e) => setToDate(e.target.value)}
+            className="px-3 py-2 rounded-lg text-sm bg-[#111] border border-white/10 text-white outline-none"
+          />
+          <div className="px-3 py-2 rounded-lg text-sm bg-[#111] border border-white/10 text-white/60">
+            Total worked: <span className="text-white font-medium">{grandTotal.toFixed(2)}h</span>
           </div>
         </div>
 
-        {/* Table */}
-        <div className="overflow-x-auto rounded-xl border border-white/5">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="border-b border-white/10 text-left text-[10px] uppercase tracking-wider text-white/30">
-                <th className="px-4 py-3">Employee</th>
-                <th className="px-4 py-3">Date</th>
-                <th className="px-4 py-3">Time (your TZ)</th>
-                <th className="px-4 py-3">Hours</th>
-                <th className="px-4 py-3">Activity</th>
-                <th className="px-4 py-3">Status</th>
-              </tr>
-            </thead>
-            <tbody>
-              {loading ? (
-                <tr><td colSpan={6} className="px-4 py-8 text-center text-white/30">Loading...</td></tr>
-              ) : sorted.length === 0 ? (
-                <tr><td colSpan={6} className="px-4 py-8 text-center text-white/30">No sessions</td></tr>
-              ) : (
-                sorted.map((s) => (
-                  <tr key={s.id} className="border-b border-white/5 hover:bg-white/[0.02]">
-                    <td className="px-4 py-2.5 font-medium whitespace-nowrap">{s.employees?.name || "—"}</td>
-                    <td className="px-4 py-2.5 text-white/50 whitespace-nowrap">{formatDate(s.started_at)}</td>
-                    <td className="px-4 py-2.5 text-white/50">
-                      <div className="space-y-0.5">
-                        {getSegments(s).map((seg, i) => (
-                          <div key={i} className="whitespace-nowrap text-xs">
-                            <span className="text-white/60">{formatTime(seg.from)} – {formatTime(seg.to)}</span>
-                            {" "}
-                            <span style={{ color: seg.type === "work" ? "#4ade80" : "#fbbf24" }}>
-                              {seg.type === "work" ? "worked" : "pause"}
-                            </span>
+        {loading ? (
+          <p className="text-white/30 text-center py-12">Loading...</p>
+        ) : dayGroups.length === 0 ? (
+          <p className="text-white/30 text-center py-12">No work sessions in this range</p>
+        ) : (
+          <div className="space-y-8">
+            {dayGroups.map((day) => (
+              <div key={day.dayKey}>
+                {/* Day header */}
+                <div className="flex items-center gap-3 mb-3">
+                  <h2 className="text-sm font-medium text-white/80 tracking-wide">{day.label}</h2>
+                  <div className="flex-1 h-px bg-white/10" />
+                  <span className="text-xs text-white/30">
+                    {day.employees.reduce((s, e) => s + e.totalHours, 0).toFixed(2)}h
+                  </span>
+                </div>
+
+                {/* Employee blocks */}
+                <div className="space-y-3">
+                  {day.employees.map((emp) => (
+                    <div
+                      key={emp.employeeId}
+                      className="rounded-2xl p-4"
+                      style={{
+                        background: "rgba(255,255,255,0.03)",
+                        border: "1px solid rgba(255,255,255,0.08)",
+                      }}
+                    >
+                      <div className="flex items-center justify-between mb-3">
+                        <p className="font-medium text-[15px]">{emp.name}</p>
+                        <p className="text-sm text-emerald-400/80">{emp.totalHours.toFixed(2)}h worked</p>
+                      </div>
+
+                      <div className="space-y-2.5">
+                        {emp.blocks.map((b, i) => (
+                          <div
+                            key={`${b.sessionId}-${i}`}
+                            className="pl-3 border-l-2 border-emerald-500/40"
+                          >
+                            <p className="text-sm text-white/80">
+                              {formatTime(b.from)} – {formatTime(b.to)}
+                            </p>
+                            <p className="text-xs text-white/40 mt-0.5">{b.activities}</p>
+                            <div className="flex gap-1.5 mt-1">
+                              <span
+                                className="text-[10px] px-1.5 py-0.5 rounded font-medium uppercase"
+                                style={{
+                                  background: b.isPaid
+                                    ? "rgba(34,197,94,0.15)"
+                                    : "rgba(255,255,255,0.05)",
+                                  color: b.isPaid ? "#4ade80" : "rgba(255,255,255,0.3)",
+                                }}
+                              >
+                                {b.isPaid ? "Paid" : "Unpaid"}
+                              </span>
+                              {b.isDisputed && (
+                                <span
+                                  className="text-[10px] px-1.5 py-0.5 rounded font-medium uppercase"
+                                  style={{
+                                    background: "rgba(245,158,11,0.15)",
+                                    color: "#fbbf24",
+                                  }}
+                                >
+                                  Disputed
+                                </span>
+                              )}
+                            </div>
                           </div>
                         ))}
                       </div>
-                    </td>
-                    <td className="px-4 py-2.5 whitespace-nowrap">{getHours(s).toFixed(2)}h</td>
-                    <td className="px-4 py-2.5 text-white/60 max-w-[220px] truncate">{getActivities(s)}</td>
-                    <td className="px-4 py-2.5 whitespace-nowrap">
-                      <div className="flex gap-1.5">
-                        <span className="text-[10px] px-1.5 py-0.5 rounded font-medium uppercase"
-                          style={{
-                            background: s.is_paid ? "rgba(34,197,94,0.15)" : "rgba(255,255,255,0.05)",
-                            color: s.is_paid ? "#4ade80" : "rgba(255,255,255,0.35)"
-                          }}>
-                          {s.is_paid ? "Paid" : "Unpaid"}
-                        </span>
-                        {s.is_disputed && (
-                          <span className="text-[10px] px-1.5 py-0.5 rounded font-medium uppercase"
-                            style={{ background: "rgba(245,158,11,0.15)", color: "#fbbf24" }}>
-                            Disputed
-                          </span>
-                        )}
-                      </div>
-                    </td>
-                  </tr>
-                ))
-              )}
-            </tbody>
-            {sorted.length > 0 && (
-              <tfoot>
-                <tr className="border-t border-white/10 text-xs">
-                  <td className="px-4 py-3 text-white/40" colSpan={3}>Total ({sorted.length} sessions)</td>
-                  <td className="px-4 py-3 font-medium">{totalHours.toFixed(2)}h</td>
-                  <td></td>
-                  <td className="px-4 py-3 text-emerald-400/70">{paidHours.toFixed(1)}h paid</td>
-                </tr>
-              </tfoot>
-            )}
-          </table>
-        </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );
