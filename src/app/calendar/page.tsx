@@ -141,16 +141,15 @@ export default function CalendarPage() {
   };
 
   const calcHoursNum = (s: Session) => {
-    if (!s.ended_at) return 0;
-    let ms = new Date(s.ended_at).getTime() - new Date(s.started_at).getTime();
-    for (const p of s.session_pauses || []) {
-      if (!p.paused_at) continue;
-      const pEnd = p.resumed_at
-        ? new Date(p.resumed_at).getTime()
-        : new Date(s.ended_at).getTime();
-      ms -= Math.max(0, pEnd - new Date(p.paused_at).getTime());
+    // Count only work segments (handles overlapping pauses correctly)
+    const segs = getSegments(s);
+    let ms = 0;
+    for (const seg of segs) {
+      if (seg.type === "work") {
+        ms += Math.max(0, new Date(seg.to).getTime() - new Date(seg.from).getTime());
+      }
     }
-    return Math.max(0, ms) / 3600000;
+    return ms / 3600000;
   };
 
   const calcHours = (s: Session) => {
@@ -182,31 +181,54 @@ export default function CalendarPage() {
 
   const getSegments = (s: Session): Segment[] => {
     if (!s.ended_at) return [];
-    const pauses = [...(s.session_pauses || [])]
+    const endMs = new Date(s.ended_at).getTime();
+    const startMs = new Date(s.started_at).getTime();
+
+    // Merge overlapping pauses into non-overlapping ranges
+    const raw = [...(s.session_pauses || [])]
       .filter((p) => p.paused_at)
-      .sort((a, b) => new Date(a.paused_at).getTime() - new Date(b.paused_at).getTime());
+      .map((p) => ({
+        start: Math.max(startMs, new Date(p.paused_at).getTime()),
+        end: Math.min(endMs, new Date(p.resumed_at || s.ended_at!).getTime()),
+      }))
+      .filter((p) => p.end > p.start)
+      .sort((a, b) => a.start - b.start);
+
+    const merged: { start: number; end: number }[] = [];
+    for (const p of raw) {
+      if (merged.length && p.start <= merged[merged.length - 1].end) {
+        merged[merged.length - 1].end = Math.max(merged[merged.length - 1].end, p.end);
+      } else {
+        merged.push({ ...p });
+      }
+    }
 
     const segments: Segment[] = [];
-    let cursor = s.started_at;
-    const end = s.ended_at;
-
-    for (const p of pauses) {
-      const pStart = p.paused_at;
-      const pEnd = p.resumed_at || end;
-      if (new Date(pStart).getTime() > new Date(cursor).getTime()) {
-        segments.push({ type: "work", from: cursor, to: pStart });
+    let cursor = startMs;
+    for (const p of merged) {
+      if (p.start > cursor) {
+        segments.push({
+          type: "work",
+          from: new Date(cursor).toISOString(),
+          to: new Date(p.start).toISOString(),
+        });
       }
-      if (new Date(pEnd).getTime() > new Date(pStart).getTime()) {
-        segments.push({ type: "pause", from: pStart, to: pEnd });
-      }
-      cursor = pEnd;
+      segments.push({
+        type: "pause",
+        from: new Date(p.start).toISOString(),
+        to: new Date(p.end).toISOString(),
+      });
+      cursor = Math.max(cursor, p.end);
     }
-    if (new Date(end).getTime() > new Date(cursor).getTime()) {
-      segments.push({ type: "work", from: cursor, to: end });
+    if (endMs > cursor) {
+      segments.push({
+        type: "work",
+        from: new Date(cursor).toISOString(),
+        to: new Date(endMs).toISOString(),
+      });
     }
-    // No pauses → single work block
     if (segments.length === 0) {
-      segments.push({ type: "work", from: s.started_at, to: end });
+      segments.push({ type: "work", from: s.started_at, to: s.ended_at });
     }
     return segments;
   };
