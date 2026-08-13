@@ -41,6 +41,7 @@ type DayEmployee = {
   name: string;
   blocks: WorkBlock[];
   totalHours: number;
+  paidHours: number;
   sessionIds: string[];
   allPaid: boolean;
   anyDisputed: boolean;
@@ -66,6 +67,8 @@ export default function BoardPage() {
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [filterEmployee, setFilterEmployee] = useState("all");
   const [filterPaid, setFilterPaid] = useState<"all" | "paid" | "unpaid">("all");
+  const [period, setPeriod] = useState<"day" | "week" | "month" | "year" | "custom">("month");
+  const [running, setRunning] = useState<{ employee_id: string; name: string; started_at: string }[]>([]);
 
   const now = new Date();
   const [fromDate, setFromDate] = useState(
@@ -74,6 +77,27 @@ export default function BoardPage() {
   const [toDate, setToDate] = useState(now.toISOString().slice(0, 10));
 
   const isAdmin = user?.role === "admin";
+
+  const applyPeriod = (p: "day" | "week" | "month" | "year") => {
+    const n = new Date();
+    const to = n.toISOString().slice(0, 10);
+    let from: Date;
+    if (p === "day") {
+      from = new Date(n.getFullYear(), n.getMonth(), n.getDate());
+    } else if (p === "week") {
+      from = new Date(n);
+      const day = from.getDay();
+      from.setDate(from.getDate() - (day === 0 ? 6 : day - 1));
+      from.setHours(0, 0, 0, 0);
+    } else if (p === "month") {
+      from = new Date(n.getFullYear(), n.getMonth(), 1);
+    } else {
+      from = new Date(n.getFullYear(), 0, 1);
+    }
+    setPeriod(p);
+    setFromDate(from.toISOString().slice(0, 10));
+    setToDate(to);
+  };
 
   useEffect(() => {
     const saved = localStorage.getItem("timeglass_board_user");
@@ -135,6 +159,41 @@ export default function BoardPage() {
       .order("started_at", { ascending: true });
 
     if (data) setSessions(data as any);
+
+    // Currently working: running, no open pause, unique, started < 16h ago
+    const cutoff = new Date(Date.now() - 16 * 60 * 60 * 1000).toISOString();
+    const { data: runData } = await supabase
+      .from("work_sessions")
+      .select(`id, employee_id, started_at, employees ( name )`)
+      .eq("status", "running")
+      .gte("started_at", cutoff)
+      .order("started_at", { ascending: false });
+
+    if (runData && runData.length > 0) {
+      const ids = runData.map((r: any) => r.id);
+      const { data: pauses } = await supabase
+        .from("session_pauses")
+        .select("session_id")
+        .in("session_id", ids)
+        .is("resumed_at", null);
+      const pausedIds = new Set((pauses || []).map((p: any) => p.session_id));
+      const seen = new Set<string>();
+      const active: { employee_id: string; name: string; started_at: string }[] = [];
+      for (const r of runData as any[]) {
+        if (pausedIds.has(r.id)) continue;
+        if (seen.has(r.employee_id)) continue;
+        seen.add(r.employee_id);
+        active.push({
+          employee_id: r.employee_id,
+          name: r.employees?.name || "Unknown",
+          started_at: r.started_at,
+        });
+      }
+      setRunning(active);
+    } else {
+      setRunning([]);
+    }
+
     setLastUpdate(new Date());
     setLoading(false);
   }, [user, fromDate, toDate]);
@@ -267,6 +326,7 @@ export default function BoardPage() {
               name: empName,
               blocks: [],
               totalHours: 0,
+              paidHours: 0,
               sessionIds: [],
               allPaid: true,
               anyDisputed: false,
@@ -281,6 +341,7 @@ export default function BoardPage() {
             sessionId: s.id,
           });
           emp.totalHours += hours;
+          if (s.is_paid) emp.paidHours += hours;
           if (!emp.sessionIds.includes(s.id)) emp.sessionIds.push(s.id);
           if (!s.is_paid) emp.allPaid = false;
           if (s.is_disputed) emp.anyDisputed = true;
@@ -352,6 +413,10 @@ export default function BoardPage() {
     (sum, d) => sum + d.employees.reduce((s, e) => s + e.totalHours, 0),
     0
   );
+  const paidTotal = dayGroups.reduce(
+    (sum, d) => sum + d.employees.reduce((s, e) => s + e.paidHours, 0),
+    0
+  );
 
   if (!user) {
     return (
@@ -411,18 +476,41 @@ export default function BoardPage() {
           </div>
         </div>
 
+        {/* Quick period */}
+        <div className="flex flex-wrap gap-2 mb-3">
+          {([
+            ["day", "Day"],
+            ["week", "Week"],
+            ["month", "Month"],
+            ["year", "Year"],
+          ] as const).map(([key, label]) => (
+            <button
+              key={key}
+              onClick={() => applyPeriod(key)}
+              className="px-3 py-1.5 rounded-lg text-xs font-medium"
+              style={{
+                background: period === key ? "rgba(124,58,237,0.35)" : "rgba(255,255,255,0.05)",
+                border: period === key ? "1px solid rgba(124,58,237,0.5)" : "1px solid rgba(255,255,255,0.08)",
+                color: period === key ? "#fff" : "rgba(255,255,255,0.5)",
+              }}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+
         {/* Filters */}
-        <div className="flex flex-wrap gap-2 mb-5">
+        <div className="flex flex-wrap gap-2 mb-4">
           <input
             type="date"
             value={fromDate}
-            onChange={(e) => setFromDate(e.target.value)}
+            onChange={(e) => { setFromDate(e.target.value); setPeriod("custom"); }}
             className="px-3 py-2 rounded-lg text-sm bg-[#111] border border-white/10 text-white outline-none"
           />
           <input
             type="date"
             value={toDate}
-            onChange={(e) => setToDate(e.target.value)}
+            onChange={(e) => { setToDate(e.target.value); setPeriod("custom"); }}
             className="px-3 py-2 rounded-lg text-sm bg-[#111] border border-white/10 text-white outline-none"
           />
           <select
@@ -446,10 +534,44 @@ export default function BoardPage() {
             <option value="paid" style={{ background: "#111" }}>Paid</option>
             <option value="unpaid" style={{ background: "#111" }}>Unpaid</option>
           </select>
-          <div className="px-3 py-2 rounded-lg text-sm bg-[#111] border border-white/10 text-white/60">
-            Total: <span className="text-white font-medium">{grandTotal.toFixed(2)}h</span>
+        </div>
+
+        {/* Summary cards */}
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 mb-4">
+          <div className="p-3 rounded-xl bg-[#111] border border-white/5">
+            <p className="text-[10px] text-white/30 uppercase">Total worked</p>
+            <p className="text-lg font-medium">{grandTotal.toFixed(2)}h</p>
+          </div>
+          <div className="p-3 rounded-xl bg-[#111] border border-emerald-500/20">
+            <p className="text-[10px] text-emerald-500/50 uppercase">Paid</p>
+            <p className="text-lg font-medium text-emerald-400">{paidTotal.toFixed(2)}h</p>
+          </div>
+          <div className="p-3 rounded-xl bg-[#111] border border-white/5">
+            <p className="text-[10px] text-white/30 uppercase">Unpaid</p>
+            <p className="text-lg font-medium text-white/60">{(grandTotal - paidTotal).toFixed(2)}h</p>
           </div>
         </div>
+
+        {/* Currently working */}
+        {running.length > 0 && (
+          <div className="mb-5 p-3 rounded-xl border border-emerald-500/30 bg-emerald-500/5">
+            <p className="text-[10px] uppercase tracking-wider text-emerald-400/70 mb-2">Currently Working</p>
+            <div className="flex flex-wrap gap-2">
+              {running.map((r) => (
+                <div
+                  key={r.employee_id}
+                  className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-emerald-500/10 border border-emerald-500/20"
+                >
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                  <span className="text-sm text-emerald-300">{r.name}</span>
+                  <span className="text-xs text-emerald-500/60">
+                    since {formatTime(new Date(r.started_at))}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
         {loading ? (
           <p className="text-white/30 text-center py-12">Loading...</p>
