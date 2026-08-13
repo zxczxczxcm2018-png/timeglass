@@ -159,15 +159,14 @@ export default function TimerPage() {
     }
   }, [router]);
 
-  // Check for interrupted sessions — only once per login
+  // Recovery ONLY for running sessions left behind (not old completed ones)
   const recoveryChecked = useRef(false);
   useEffect(() => {
     if (!user || recoveryChecked.current) return;
-    if (timerRef.current) return;
     recoveryChecked.current = true;
+    if (timerRef.current) return;
 
     (async () => {
-      // 1. Running sessions left behind
       const { data: running } = await supabase
         .from("work_sessions")
         .select("id, started_at, custom_note")
@@ -175,60 +174,36 @@ export default function TimerPage() {
         .eq("status", "running")
         .order("started_at", { ascending: false });
 
-      if (running && running.length > 0) {
-        const latest = running[0];
-        const endTime = new Date().toISOString();
-        for (const s of running) {
-          await supabase.from("work_sessions").update({
-            status: "completed",
-            ended_at: endTime,
-          }).eq("id", s.id);
-        }
-        const { data: acts } = await supabase
-          .from("session_activities")
-          .select("id")
-          .eq("session_id", latest.id)
-          .limit(1);
-        if ((!acts || acts.length === 0) && latest.custom_note !== "__skipped__") {
-          setRecoverySession({
-            id: latest.id,
-            started_at: latest.started_at,
-            ended_at: endTime,
-          });
-          setShowRecovery(true);
-        }
-        return;
+      if (!running || running.length === 0) return;
+
+      const latest = running[0];
+      const startMs = new Date(latest.started_at).getTime();
+      const endMs = Math.min(Date.now(), startMs + 8 * 60 * 60 * 1000);
+      const endTime = new Date(endMs).toISOString();
+
+      for (const s of running) {
+        await supabase.from("work_sessions").update({
+          status: "completed",
+          ended_at: s.id === latest.id ? endTime : latest.started_at,
+          custom_note: s.custom_note === "__skipped__" ? "__skipped__" : s.custom_note,
+        }).eq("id", s.id);
       }
 
-      // 2. Completed without activity, not skipped
-      const since = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
-      const { data: completed } = await supabase
-        .from("work_sessions")
-        .select("id, started_at, ended_at, custom_note")
-        .eq("employee_id", user.id)
-        .eq("status", "completed")
-        .gte("ended_at", since)
-        .order("ended_at", { ascending: false })
-        .limit(10);
+      if (latest.custom_note === "__skipped__") return;
 
-      if (completed) {
-        for (const s of completed) {
-          if (s.custom_note === "__skipped__") continue;
-          const { data: acts } = await supabase
-            .from("session_activities")
-            .select("id")
-            .eq("session_id", s.id)
-            .limit(1);
-          if (!acts || acts.length === 0) {
-            setRecoverySession({
-              id: s.id,
-              started_at: s.started_at,
-              ended_at: s.ended_at || s.started_at,
-            });
-            setShowRecovery(true);
-            break;
-          }
-        }
+      const { data: acts } = await supabase
+        .from("session_activities")
+        .select("id")
+        .eq("session_id", latest.id)
+        .limit(1);
+
+      if (!acts || acts.length === 0) {
+        setRecoverySession({
+          id: latest.id,
+          started_at: latest.started_at,
+          ended_at: endTime,
+        });
+        setShowRecovery(true);
       }
     })();
   }, [user]);
@@ -662,11 +637,25 @@ export default function TimerPage() {
 
   const handleRecoverySkip = async () => {
     if (recoverySession) {
-      // Mark so it never shows again
       await supabase
         .from("work_sessions")
         .update({ custom_note: "__skipped__" })
         .eq("id", recoverySession.id);
+    }
+    // Also mark any other empty completed sessions for this user so they never pop again
+    if (user) {
+      const { data: empty } = await supabase
+        .from("work_sessions")
+        .select("id, session_activities(id)")
+        .eq("employee_id", user.id)
+        .eq("status", "completed");
+      if (empty) {
+        for (const s of empty as any[]) {
+          if (!s.session_activities || s.session_activities.length === 0) {
+            await supabase.from("work_sessions").update({ custom_note: "__skipped__" }).eq("id", s.id);
+          }
+        }
+      }
     }
     setShowRecovery(false);
     setRecoverySession(null);
