@@ -452,8 +452,8 @@ export default function BoardPage() {
   }
 
   return (
-    <div className="min-h-screen w-full bg-black text-white p-3 sm:p-6 md:p-8 font-sans">
-      <div className="w-full max-w-5xl mx-auto">
+    <div className="min-h-screen w-full min-w-full bg-black text-white p-3 sm:p-5 md:p-6 lg:px-10 lg:py-8 font-sans box-border">
+      <div className="w-full max-w-none">
         {/* Header */}
         <div className="flex flex-wrap items-center justify-between gap-3 mb-5">
           <div>
