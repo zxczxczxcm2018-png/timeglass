@@ -174,11 +174,18 @@ export default function BoardPage() {
     return () => clearInterval(interval);
   }, [load, user]);
 
-  // Times always in viewer's local timezone
+  // Times in viewer's local timezone, ALWAYS AM/PM (forced for all locales)
   const formatDate = (iso: string) =>
     new Date(iso).toLocaleDateString(undefined, { day: "2-digit", month: "short", year: "numeric" });
-  const formatTime = (iso: string) =>
-    new Date(iso).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+  const formatTime = (iso: string) => {
+    const d = new Date(iso);
+    let h = d.getHours();
+    const m = String(d.getMinutes()).padStart(2, "0");
+    const ampm = h >= 12 ? "PM" : "AM";
+    h = h % 12;
+    if (h === 0) h = 12;
+    return `${h}:${m} ${ampm}`;
+  };
 
   const getHours = (s: { started_at: string; ended_at: string | null; session_pauses?: { paused_at: string; resumed_at: string | null }[] }) => {
     if (!s.ended_at) return 0;
