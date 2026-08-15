@@ -160,7 +160,8 @@ export default function TimerPage() {
     }
   }, [router]);
 
-  // Recovery ONLY for running sessions left behind (not old completed ones)
+  // Recovery: complete stuck sessions at LAST HEARTBEAT (not "now")
+  // PC off / crash → time after last online is NOT counted
   const recoveryChecked = useRef(false);
   useEffect(() => {
     if (!user || recoveryChecked.current) return;
@@ -170,40 +171,75 @@ export default function TimerPage() {
     (async () => {
       const { data: running } = await supabase
         .from("work_sessions")
-        .select("id, started_at, custom_note")
+        .select("id, started_at, custom_note, last_heartbeat_at")
         .eq("employee_id", user.id)
         .eq("status", "running")
         .order("started_at", { ascending: false });
 
       if (!running || running.length === 0) return;
 
-      const latest = running[0];
-      const startMs = new Date(latest.started_at).getTime();
-      const endMs = Math.min(Date.now(), startMs + 8 * 60 * 60 * 1000);
-      const endTime = new Date(endMs).toISOString();
+      const STALE_MS = 2 * 60 * 1000; // no heartbeat for 2 min = offline
+      const now = Date.now();
+      let recoveryTarget: { id: string; started_at: string; ended_at: string } | null = null;
 
-      for (const s of running) {
+      for (const s of running as any[]) {
+        const startMs = new Date(s.started_at).getTime();
+        const hbMs = s.last_heartbeat_at
+          ? new Date(s.last_heartbeat_at).getTime()
+          : startMs;
+        const age = now - hbMs;
+
+        // Still fresh heartbeat + this is the active local timer? skip
+        // Otherwise complete at last heartbeat (never at "now")
+        let endMs = hbMs;
+        if (age < STALE_MS && timerRef.current?.sessionId === s.id) {
+          continue;
+        }
+        // Cap: never end before start
+        endMs = Math.max(startMs, endMs);
+        // If no heartbeat ever and session is old, end shortly after start (not 18h of offline)
+        if (!s.last_heartbeat_at && age > STALE_MS) {
+          endMs = startMs; // zero-length if never heartbeated and abandoned
+        }
+
+        const endTime = new Date(endMs).toISOString();
+
+        // Close any open pause at end time
+        await supabase
+          .from("session_pauses")
+          .update({ resumed_at: endTime })
+          .eq("session_id", s.id)
+          .is("resumed_at", null);
+
         await supabase.from("work_sessions").update({
           status: "completed",
-          ended_at: s.id === latest.id ? endTime : latest.started_at,
+          ended_at: endTime,
           custom_note: s.custom_note === "__skipped__" ? "__skipped__" : s.custom_note,
         }).eq("id", s.id);
+
+        if (
+          !recoveryTarget &&
+          s.custom_note !== "__skipped__" &&
+          endMs > startMs + 60 * 1000 // only offer recovery if >1 min work
+        ) {
+          recoveryTarget = {
+            id: s.id,
+            started_at: s.started_at,
+            ended_at: endTime,
+          };
+        }
       }
 
-      if (latest.custom_note === "__skipped__") return;
+      if (!recoveryTarget) return;
 
       const { data: acts } = await supabase
         .from("session_activities")
         .select("id")
-        .eq("session_id", latest.id)
+        .eq("session_id", recoveryTarget.id)
         .limit(1);
 
       if (!acts || acts.length === 0) {
-        setRecoverySession({
-          id: latest.id,
-          started_at: latest.started_at,
-          ended_at: endTime,
-        });
+        setRecoverySession(recoveryTarget);
         setShowRecovery(true);
       }
     })();
@@ -304,13 +340,17 @@ export default function TimerPage() {
         }
       }, 2 * 60 * 1000);
 
-      // Auto-complete after 1 hour offline
+      // Auto-complete after 30 min offline (app still open but no network)
       offlineCompleteRef.current = setTimeout(async () => {
         if (!navigator.onLine && timerRef.current) {
           const t = timerRef.current;
+          const endAt = t.pausedAt
+            ? new Date(t.pausedAt).toISOString()
+            : new Date().toISOString();
           await supabase.from("work_sessions").update({
-            ended_at: new Date().toISOString(),
+            ended_at: endAt,
             status: "completed",
+            last_heartbeat_at: endAt,
           }).eq("id", t.sessionId);
           timerRef.current = null;
           saveTimer(null);
@@ -318,10 +358,10 @@ export default function TimerPage() {
           setIsPaused(false);
           setSessionId(null);
           setSeconds(0);
-          setStatusText("Auto-completed (offline 1h)");
-          showToast("Session auto-completed after 1h offline");
+          setStatusText("Auto-completed (offline 30 min)");
+          showToast("Session auto-completed after 30 min offline");
         }
-      }, 60 * 60 * 1000);
+      }, 30 * 60 * 1000);
     };
 
     const onOnline = async () => {
@@ -367,6 +407,23 @@ export default function TimerPage() {
     };
   }, []);
 
+  // Heartbeat every 30s while timer is active — used to detect PC off / crash
+  useEffect(() => {
+    if (!isRunning || !sessionId) return;
+    const beat = () => {
+      if (!navigator.onLine) return;
+      supabase
+        .from("work_sessions")
+        .update({ last_heartbeat_at: new Date().toISOString() })
+        .eq("id", sessionId)
+        .eq("status", "running")
+        .then(() => {});
+    };
+    beat();
+    const id = setInterval(beat, 30 * 1000);
+    return () => clearInterval(id);
+  }, [isRunning, sessionId]);
+
   // 30-min reminder
   useEffect(() => {
     if (isRunning && !isPaused) {
@@ -407,25 +464,28 @@ export default function TimerPage() {
   const handleStart = async () => {
     if (!user) return;
 
-    // Close stuck running sessions
+    // Close stuck running sessions at last heartbeat (not now)
     const { data: stuck } = await supabase
       .from("work_sessions")
-      .select("id")
+      .select("id, started_at, last_heartbeat_at")
       .eq("employee_id", user.id)
       .eq("status", "running");
     if (stuck) {
-      for (const s of stuck) {
+      for (const s of stuck as any[]) {
+        const endAt = s.last_heartbeat_at || s.started_at;
         await supabase.from("work_sessions").update({
-          ended_at: new Date().toISOString(),
+          ended_at: endAt,
           status: "completed",
         }).eq("id", s.id);
       }
     }
 
+    const nowIso = new Date().toISOString();
     const { data, error } = await supabase.from("work_sessions").insert({
       employee_id: user.id,
-      started_at: new Date().toISOString(),
+      started_at: nowIso,
       status: "running",
+      last_heartbeat_at: nowIso,
     }).select().single();
     if (error) { setStatusText("Error starting"); return; }
 

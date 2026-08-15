@@ -160,13 +160,13 @@ export default function BoardPage() {
 
     if (data) setSessions(data as any);
 
-    // Currently working: running, no open pause, unique, started < 16h ago
-    const cutoff = new Date(Date.now() - 16 * 60 * 60 * 1000).toISOString();
+    // Currently working: running + fresh heartbeat (≤2 min) + no open pause
+    const hbCutoff = new Date(Date.now() - 2 * 60 * 1000).toISOString();
     const { data: runData } = await supabase
       .from("work_sessions")
-      .select(`id, employee_id, started_at, employees ( name )`)
+      .select(`id, employee_id, started_at, last_heartbeat_at, employees ( name )`)
       .eq("status", "running")
-      .gte("started_at", cutoff)
+      .gte("last_heartbeat_at", hbCutoff)
       .order("started_at", { ascending: false });
 
     if (runData && runData.length > 0) {
